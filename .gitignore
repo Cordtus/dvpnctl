@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 build/
+dev-docs/
+AGENTS.md
