@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""dvpnctl - Sentinel dVPN full-tunnel + kill-switch controller.
+
+Wraps the official `sentinel-dvpncli` so that:
+  * all traffic is routed through the WireGuard tunnel (AllowedIPs 0.0.0.0/0),
+  * a host kill switch drops anything that would otherwise leak to clearnet
+    (the SDK writes the wg-quick PostUp/PreDown iptables rules for us),
+  * the tunnel is owned by a systemd unit so it stays up until you deactivate it,
+  * endpoints can be switched in one command.
+
+Not affiliated with, and with no dependency on, MathNodes/meile. The only
+required runtime dependency is the official Sentinel CLI (sentinel-dvpncli v5).
+
+The privileged pieces (systemd unit, wg-quick) are installed by ./install.sh.
+User-level commands here only need the wallet keyring and the chain.
+
+Tunables live in ~/.config/dvpnctl/config.json (see DEFAULTS below).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.request import Request, urlopen
+
+# ---------------------------------------------------------------- constants
+
+HOME = os.path.expanduser("~")
+CFG_DIR = os.environ.get("DVPNCTL_CONFIG_DIR", os.path.join(HOME, ".config", "dvpnctl"))
+CFG_FILE = os.path.join(CFG_DIR, "config.json")
+SESSION_FILE = os.path.join(CFG_DIR, "session.env")
+NODES_CACHE = os.path.join(CFG_DIR, "nodes.yaml")
+NODES_ORDER = os.path.join(CFG_DIR, "nodes.order")
+WALLET_BACKUP = os.path.join(CFG_DIR, "wallet-backup.json")
+CLI_HOME = os.path.join(HOME, ".sentinel-dvpncli")
+
+# Public Sentinel LCD/REST endpoints for balance lookups. Override in config.
+LCD_ENDPOINTS = [
+    "https://sentinel-api.polkachu.com",
+    "https://api.sentinel.co",
+]
+
+# Public Sentinel RPC (cometbft) endpoints. The CLI requires an explicit port
+# and uses only the first --rpc.addrs value, so we try these in order ourselves.
+# rpc.sentinel.co is last because it rate-limits aggressively (HTTP 429).
+RPC_FALLBACKS = [
+    "https://sentinel-rpc.polkachu.com:443",
+    "https://sentinel-rpc.publicnode.com:443",
+    "https://rpc.sentinel.co:443",
+]
+
+DEFAULTS = {
+    # --- chain / keyring ---
+    "rpc": "https://sentinel-rpc.polkachu.com:443",  # writes use this endpoint
+    "chain_id": "sentinelhub-2",
+    "keyring_backend": "os",   # user-side keyring backend
+    "key_name": "main",
+    "cli_home": CLI_HOME,      # engine data dir (~/.sentinel-dvpncli)
+    # --- session sizing ---
+    "session_gigabytes": 5,    # 0 switches to time-based sessions
+    "session_hours": 0,        # used when session_gigabytes == 0
+    # --- node selection ---
+    "max_price_per_gb": 15.0,  # DVPN/GB ceiling for `dvpnctl nodes` / `best`
+    "max_peers": 60,           # skip crowded nodes when auto-selecting
+    # --- tunnel ---
+    "unit_name": "dvpnctl.service",
+    "root_home": "/var/lib/dvpnctl",  # root-side engine home (unit keyring)
+    "iface": "wg0",
+    "exclude_lan": True,       # keep RFC1918/loopback out of the tunnel
+    "node": "",                # last selected node address (internal)
+}
+
+# Subnets kept out of the tunnel when exclude_lan is true. Loopback is always
+# excluded; the rest are the private ranges a LAN needs to stay reachable.
+LAN_EXCLUDES = ["127.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12",
+                "10.0.0.0/8", "::1/128", "fe80::/10", "fd00::/8"]
+
+NODES_CACHE_TTL = 3600  # seconds; `dvpnctl nodes -r` forces a refresh
+
+
+# ---------------------------------------------------------------- helpers
+
+def cli_path() -> str:
+    for p in ("/usr/local/bin/sentinel-dvpncli",
+              os.path.join(HOME, ".local", "bin", "sentinel-dvpncli")):
+        if os.path.exists(p):
+            return p
+    found = shutil.which("sentinel-dvpncli")
+    if not found:
+        sys.exit("sentinel-dvpncli not found; run ./install.sh")
+    return found
+
+
+def load_cfg() -> dict:
+    cfg = dict(DEFAULTS)
+    if os.path.exists(CFG_FILE):
+        with open(CFG_FILE) as f:
+            cfg.update(json.load(f))
+    return cfg
+
+
+def save_cfg(cfg: dict) -> None:
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(CFG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+
+
+def unit_name() -> str:
+    return load_cfg()["unit_name"]
+
+
+def iface() -> str:
+    return load_cfg()["iface"]
+
+
+def cli_home() -> str:
+    return load_cfg()["cli_home"]
+
+
+def run(cmd: list[str], check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        sys.exit(p.returncode)
+    return p
+
+
+def cli(args: list[str], check: bool = True, stdin: str | None = None,
+        rpc: bool = False) -> str:
+    # The binary emits a harmless sonic warning on stderr; stdout is clean.
+    base = [cli_path(), "--home", cli_home(), "--log.level", "error"]
+    if not rpc:
+        return run([*base, *args], check=check, stdin=stdin).stdout
+    # Query only: retry across RPC endpoints on failure/rate-limit.
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    p = None
+    for url in endpoints:
+        p = run([*base, *args, "--rpc.addrs", url, "--rpc.timeout", "15s"],
+                check=False, stdin=stdin)
+        if p.returncode == 0:
+            return p.stdout
+    if check and p is not None:
+        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        sys.exit(p.returncode)
+    return p.stdout if p is not None else ""
+
+
+def tx_with_retry(args: list[str], verify) -> str:
+    """Run a tx, retrying across RPC endpoints.
+
+    verify() must return truthy if the tx already took effect. It is checked
+    after a failed broadcast so a response timeout cannot cause a double-submit.
+    """
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    last = None
+    for url in endpoints:
+        p = run([cli_path(), "--home", cli_home(), "--log.level", "error", "tx", *args,
+                 "--keyring.backend", cfg["keyring_backend"],
+                 "--tx.from-name", cfg["key_name"],
+                 "--output-format", "json",
+                 "--rpc.addrs", url, "--rpc.timeout", "15s"], check=False)
+        if p.returncode == 0:
+            return p.stdout
+        last = p
+        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        time.sleep(3)
+        if verify():
+            print("transaction landed despite the RPC error; continuing")
+            return ""
+    sys.stderr.write((last.stdout or "") + (last.stderr or "") if last else "")
+    sys.exit("transaction failed on all RPC endpoints")
+
+
+def cli_keys(args: list[str], stdin: str | None = None) -> str:
+    cfg = load_cfg()
+    return cli(["keys", *args, "--keyring.backend", cfg["keyring_backend"]],
+               check=True, stdin=stdin)
+
+
+def extract_json(text: str):
+    """Pull a JSON value out of CLI output that may also contain banners."""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def walk(obj):
+    """Yield every dict nested anywhere inside obj."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v)
+
+
+def have_yaml():
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        sys.exit("python-yaml is required (Arch: sudo pacman -S python-yaml)")
+
+
+# ---------------------------------------------------------------- wallet
+
+def my_address() -> str | None:
+    out = cli_keys(["list", "--output-format", "json"])
+    data = extract_json(out)
+    if not data:
+        return None
+    items = data if isinstance(data, list) else [data]
+    name = load_cfg()["key_name"]
+    for k in items:
+        if isinstance(k, dict) and k.get("name") == name:
+            return k.get("address")
+    return None
+
+
+def wallet_exists() -> bool:
+    return my_address() is not None
+
+
+def cmd_init(args):
+    if wallet_exists():
+        print(f"wallet already exists: {my_address()}")
+        return
+    # keys add prompts for a mnemonic then a bip39 passphrase; blank lines accept defaults.
+    out = cli_keys(["add", load_cfg()["key_name"], "--output-format", "json"],
+                   stdin="\n\n")
+    data = extract_json(out)
+    if not data or "address" not in data:
+        sys.stderr.write(out)
+        sys.exit("could not parse generated key")
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(WALLET_BACKUP, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(WALLET_BACKUP, 0o600)
+    print(f"address: {data['address']}")
+    print(f"mnemonic backup written to {WALLET_BACKUP} (mode 600)")
+    print("Move that file somewhere safe; it is the only way to recover funds.")
+
+
+def cmd_address(args):
+    addr = my_address()
+    print(addr if addr else "no wallet yet - run: dvpnctl init")
+    if not addr:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------- chain
+
+def balance_dvpn() -> float | None:
+    addr = my_address()
+    if not addr:
+        return None
+    for base in LCD_ENDPOINTS:
+        try:
+            req = Request(f"{base}/cosmos/bank/v1beta1/balances/{addr}",
+                          headers={"User-Agent": "dvpnctl"})
+            with urlopen(req, timeout=10) as r:
+                data = json.load(r)
+            for c in data.get("balances", []):
+                if c.get("denom") == "udvpn":
+                    return int(c["amount"]) / 1e6
+            return 0.0
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------- nodes
+
+def normalize_nodes(raw: str) -> list[dict]:
+    import yaml
+    data = yaml.safe_load(raw) or {}
+    nodes = []
+    for it in data.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        info = it.get("info") or {}
+        node = it.get("node") or {}
+        if info.get("service_type") != "wireguard":
+            continue  # v2ray/xray are SOCKS proxies: not a full tunnel
+        gp = {p["denom"]: p for p in (node.get("gigabyte_prices") or []) if "denom" in p}
+        hp = {p["denom"]: p for p in (node.get("hourly_prices") or []) if "denom" in p}
+        loc = info.get("location") or {}
+        entry = {
+            "address": node.get("address") or info.get("addr"),
+            "moniker": info.get("moniker") or "?",
+            "service_type": info.get("service_type"),
+            "country": loc.get("country_code") or "??",
+            "city": loc.get("city") or "",
+            "downlink": int(info.get("downlink") or 0),
+            "uplink": int(info.get("uplink") or 0),
+            "peers": int(info.get("peers") or 0),
+            "gb": None,
+            "hour": None,
+        }
+        if "udvpn" in gp:
+            entry["gb"] = {"base": gp["udvpn"]["base_value"],
+                           "quote": int(gp["udvpn"]["quote_value"])}
+        if "udvpn" in hp:
+            entry["hour"] = {"base": hp["udvpn"]["base_value"],
+                             "quote": int(hp["udvpn"]["quote_value"])}
+        if entry["gb"] or entry["hour"]:
+            nodes.append(entry)
+    return nodes
+
+
+def fetch_nodes(limit: int = 400, refresh: bool = False) -> list[dict]:
+    if not refresh and os.path.exists(NODES_CACHE):
+        age = time.time() - os.path.getmtime(NODES_CACHE)
+        if age < NODES_CACHE_TTL:
+            with open(NODES_CACHE) as f:
+                return normalize_nodes(f.read())
+    out = cli(["query", "nodes", "--status", "active",
+               "--page.limit", str(limit), "--page.count-total"], rpc=True)
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(NODES_CACHE, "w") as f:
+        f.write(out)
+    return normalize_nodes(out)
+
+
+def sort_nodes(nodes: list[dict]) -> list[dict]:
+    # cheapest usable nodes first, then fastest
+    def key(n):
+        price = (n["gb"] or n["hour"])["quote"]
+        return (price, -n["downlink"])
+    return sorted(nodes, key=key)
+
+
+def gb_price(node: dict) -> float | None:
+    return node["gb"]["quote"] / 1e6 if node.get("gb") else None
+
+
+def max_price_str(node: dict) -> str:
+    p = node["gb"] or node["hour"]
+    return f"udvpn:{p['base']},{p['quote']}"
+
+
+def best_node(cfg: dict, nodes: list[dict]) -> dict:
+    cap = cfg["max_price_per_gb"]
+    pool = [n for n in nodes
+            if n.get("gb") and gb_price(n) <= cap and n["peers"] <= cfg["max_peers"]]
+    if not pool:
+        pool = [n for n in nodes if n.get("gb")] or nodes
+    return max(pool, key=lambda n: n["downlink"])
+
+
+def fetch_one(addr: str) -> dict | None:
+    out = cli(["query", "node", addr], rpc=True)
+    # query node returns {info, node}; reuse the list normalizer
+    import yaml
+    data = yaml.safe_load(out) or {}
+    wrapped = {"items": [data]}
+    nodes = normalize_nodes(yaml.safe_dump(wrapped))
+    return nodes[0] if nodes else None
+
+
+def resolve_node(cfg: dict, spec: str, nodes: list[dict]) -> dict:
+    if not spec or spec in ("best", "auto"):
+        return best_node(cfg, nodes)
+    if spec.startswith("sentnode"):
+        for n in nodes:
+            if n["address"] == spec:
+                return n
+        one = fetch_one(spec)
+        if not one:
+            sys.exit(f"node {spec} is not an active wireguard node with udvpn pricing")
+        return one
+    if spec.isdigit():
+        idx = int(spec)
+        order = []
+        if os.path.exists(NODES_ORDER):
+            order = [l.strip() for l in open(NODES_ORDER) if l.strip()]
+        if not order:
+            cfg = load_cfg()
+            order = [n["address"] for n in sort_nodes(nodes)
+                     if n.get("gb") and gb_price(n) <= cfg["max_price_per_gb"]]
+        if not (1 <= idx <= len(order)):
+            sys.exit(f"index {idx} out of range (1..{len(order)}) - run `dvpnctl nodes`")
+        addr = order[idx - 1]
+        for n in nodes:
+            if n["address"] == addr:
+                return n
+        one = fetch_one(addr)
+        if not one:
+            sys.exit(f"node #{idx} ({addr}) is no longer available")
+        return one
+    matches = [n for n in nodes if spec.lower() in n["moniker"].lower()]
+    if not matches:
+        sys.exit(f"no node matches {spec!r}")
+    if len(matches) > 1:
+        print("ambiguous; matches:")
+        for m in matches[:10]:
+            print(f"  {m['moniker']} {m['address']} {m['country']}")
+        sys.exit(1)
+    return matches[0]
+
+
+def cmd_nodes(args):
+    cfg = load_cfg()
+    nodes = sort_nodes(fetch_nodes(refresh=args.refresh))
+    if args.country:
+        nodes = [n for n in nodes if n["country"].upper() == args.country.upper()]
+    if not args.all:
+        nodes = [n for n in nodes if gb_price(n) is not None
+                 and gb_price(n) <= cfg["max_price_per_gb"]]
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(NODES_ORDER, "w") as f:
+        f.write("\n".join(n["address"] for n in nodes) + "\n")
+    print(f"{'#':>3} {'DVPN/GB':>9} {'down MB/s':>9} {'peers':>5} {'CC':>3}  moniker (address)")
+    for i, n in enumerate(nodes, 1):
+        p = gb_price(n)
+        print(f"{i:>3} {p if p is not None else float('nan'):>9.3f} "
+              f"{n['downlink']/1e6:>9.2f} {n['peers']:>5} {n['country']:>3}  "
+              f"{n['moniker']} ({n['address']})")
+    print(f"\n{len(nodes)} nodes. Connect with: dvpnctl up <#>|best")
+
+
+def cmd_best(args):
+    cfg = load_cfg()
+    nodes = fetch_nodes()
+    n = best_node(cfg, nodes)
+    print(json.dumps(n, indent=2))
+
+
+# ---------------------------------------------------------------- sessions
+
+def find_active_session(addr: str, node: str, timeout: float = 20.0) -> int | None:
+    """Newest active session for a node. Queries every RPC and takes the max so a
+    lagging node cannot hide a session that another node already has."""
+    import yaml
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    deadline = time.time() + timeout
+    while True:
+        best = None
+        for url in endpoints:
+            p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
+                     "query", "sessions", "--account-addr", addr, "--page.limit", "100",
+                     "--rpc.addrs", url, "--rpc.timeout", "15s"], check=False)
+            if p.returncode != 0:
+                continue
+            data = yaml.safe_load(p.stdout) or {}
+            for d in walk(data):
+                sid = d.get("id")
+                if (d.get("node_address") == node and session_active(d.get("status"))
+                        and isinstance(sid, (int, float))):
+                    # the YAML emitter may render uint64 ids as 6.1139744e+07
+                    sid = int(sid)
+                    if best is None or sid > best:
+                        best = sid
+        if best is not None:
+            return best
+        if time.time() >= deadline:
+            return None
+        time.sleep(3)
+
+
+def tx_session_id(text: str) -> int | None:
+    """Pull the session id from a tx's own events (authoritative, no stale read)."""
+    data = extract_json(text)
+    if not data:
+        return None
+    ids = []
+    for d in walk(data):
+        if d.get("key") == "session_id":
+            v = str(d.get("value", "")).strip('"')
+            if v.isdigit():
+                ids.append(int(v))
+    return max(ids) if ids else None
+
+
+def start_session(cfg: dict, node: dict, reconcile: bool = True) -> int:
+    addr = my_address()
+    if reconcile:
+        # tidy stale/duplicate sessions and reuse a good one if it exists
+        kept = reconcile_sessions({node["address"]: -1})
+        if node["address"] in kept:
+            sid = kept[node["address"]]
+            print(f"reusing active session {sid} on {node['moniker']}")
+            return sid
+    existing = find_active_session(addr, node["address"], timeout=0)
+    if existing is not None:
+        print(f"reusing active session {existing} on {node['moniker']}")
+        return existing
+    if cfg["session_gigabytes"] > 0:
+        price = node["gb"]
+        if not price:
+            sys.exit(f"{node['moniker']} has no udvpn gigabyte price; pick another node")
+        mode = ["--gigabytes", str(cfg["session_gigabytes"])]
+        deposit = price["quote"] * cfg["session_gigabytes"] / 1e6
+    else:
+        price = node["hour"]
+        if not price:
+            sys.exit(f"{node['moniker']} has no udvpn hourly price; pick another node")
+        mode = ["--hours", str(cfg["session_hours"])]
+        deposit = price["quote"] * cfg["session_hours"] / 1e6
+
+    bal = balance_dvpn()
+    need = deposit + 0.1
+    if bal is not None and bal < need:
+        print(f"insufficient balance: have {bal:.4f} DVPN, need ~{need:.4f} DVPN "
+              f"for a {cfg['session_gigabytes'] or cfg['session_hours']} "
+              f"{'GB' if cfg['session_gigabytes'] else 'h'} session")
+        print(f"fund: {addr}")
+        sys.exit(2)
+
+    max_price = max_price_str(node)
+    print(f"starting session on {node['moniker']} ({node['address']}) "
+          f"deposit ~{deposit:.4f} DVPN ...")
+    out = tx_with_retry(["session-start", node["address"], *mode, "--max-price", max_price],
+                        lambda: find_active_session(addr, node["address"], timeout=0) is not None)
+
+    # Prefer the id in the tx's own events; fall back to an on-chain lookup.
+    sid = tx_session_id(out) or find_active_session(addr, node["address"])
+    if sid is None:
+        sys.exit("session start broadcast, but no active session was found")
+    cfg["node"] = node["address"]
+    cfg["node_moniker"] = node["moniker"]
+    save_cfg(cfg)
+    return sid
+
+
+def session_status(sid: int):
+    import yaml
+    raw = cli(["query", "session", str(sid)], rpc=True)
+    data = yaml.safe_load(raw) or {}
+    for d in walk(data):
+        v = d.get("id")
+        if isinstance(v, (int, float)) and int(v) == sid and "status" in d:
+            return d.get("status")
+    return None
+
+
+def session_active(v) -> bool:
+    return v in (1, "1", "active", "STATUS_ACTIVE")
+
+
+def cancel_session(sid: int, wait: bool = False) -> None:
+    tx_with_retry(["session-cancel", str(sid)],
+                  lambda: session_status(sid) is not None
+                  and not session_active(session_status(sid)))
+    if wait:
+        # cancel only marks inactive_pending; the chain deletes it a block or
+        # two later. Wait until it is gone so a new session gets a new id.
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if session_status(sid) is None:
+                return
+            time.sleep(3)
+        sys.exit(f"session {sid} did not clear after cancel; try again shortly")
+
+
+def session_on(url: str, sid: int) -> bool:
+    import yaml
+    p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
+             "query", "session", str(sid),
+             "--rpc.addrs", url, "--rpc.timeout", "15s"], check=False)
+    if p.returncode != 0:
+        return False
+    data = yaml.safe_load(p.stdout) or {}
+    for d in walk(data):
+        v = d.get("id")
+        if isinstance(v, (int, float)) and int(v) == sid and session_active(d.get("status")):
+            return True
+    return False
+
+
+def working_rpc(sid: int) -> str:
+    """First endpoint that actually reports this session active (RPC nodes lag)."""
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    for url in endpoints:
+        if session_on(url, sid):
+            return url
+    return cfg["rpc"]
+
+
+def write_session_file(sid: int) -> None:
+    """Write the values the systemd unit needs to run `connect`."""
+    cfg = load_cfg()
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(SESSION_FILE, "w") as f:
+        f.write(f"DVPNCTL_SESSION_ID={sid}\n")
+        f.write(f"DVPNCTL_RPC={working_rpc(sid)}\n")
+        f.write(f"DVPNCTL_CLI={cli_path()}\n")
+        f.write(f"DVPNCTL_ROOT_HOME={cfg['root_home']}\n")
+        f.write(f"DVPNCTL_IFACE={cfg['iface']}\n")
+        if cfg["exclude_lan"]:
+            f.write(f"DVPNCTL_EXCLUDE=--wireguard.exclude-addrs={','.join(LAN_EXCLUDES)}\n")
+        else:
+            f.write("DVPNCTL_EXCLUDE=--wireguard.exclude-addrs=127.0.0.0/8,::1/128\n")
+
+
+def read_session_file() -> int | None:
+    if not os.path.exists(SESSION_FILE):
+        return None
+    for line in open(SESSION_FILE):
+        m = re.match(r"\s*DVPNCTL_SESSION_ID=(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def all_sessions() -> list[dict]:
+    """Every session on the account, keyed by id, with the freshest view across
+    all RPCs (they disagree while the chain catches up)."""
+    import yaml
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    by_id: dict[int, dict] = {}
+    for url in endpoints:
+        p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
+                 "query", "sessions", "--account-addr", my_address(),
+                 "--page.limit", "200", "--rpc.addrs", url, "--rpc.timeout", "15s"],
+                check=False)
+        if p.returncode != 0:
+            continue
+        for d in walk(yaml.safe_load(p.stdout) or {}):
+            sid = d.get("id")
+            if not isinstance(sid, (int, float)):
+                continue
+            sid = int(sid)
+            # a later endpoint reporting a different status may be stale; keep
+            # the highest status value (active=1 < pending=2 < inactive=3)
+            prev = by_id.get(sid)
+            if prev is None or status_rank(d.get("status")) > status_rank(prev.get("status")):
+                by_id[sid] = {**d, "id": sid}
+    return list(by_id.values())
+
+
+def status_rank(v) -> int:
+    if session_active(v):
+        return 1
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def reconcile_sessions(wanted: dict[str, int]) -> dict[str, int]:
+    """Make the account's sessions match `wanted` (node_address -> preferred id).
+
+    Returns node_address -> usable active session id. Rules, newest-first:
+      * inactive/inactive-pending sessions are cancelled (cleanup);
+      * for a wanted node, keep exactly one active session (the preferred id if
+        it is still active, else the newest) and cancel the rest;
+      * active sessions on nodes we do not want are left alone (not ours to kill)
+        unless `prune_others` is set.
+    """
+    sessions = all_sessions()
+    kept: dict[str, int] = {}
+
+    def cancel(sid: int, why: str):
+        print(f"  cancel session {sid} ({why})")
+        try:
+            cancel_session(sid, wait=False)
+        except SystemExit:
+            print(f"  warning: could not cancel {sid}; it will expire on its own")
+
+    # 1. cleanup: anything already inactive-pending is dead weight
+    for s in sessions:
+        if not session_active(s.get("status")):
+            cancel(s["id"], "stale/inactive")
+
+    # 2. per wanted node, pick the keeper and cancel duplicates
+    active = [s for s in sessions if session_active(s.get("status"))]
+    for node, preferred in wanted.items():
+        here = sorted((s for s in active if s.get("node_address") == node),
+                      key=lambda s: s["id"], reverse=True)
+        if not here:
+            continue
+        keeper = None
+        for s in here:
+            if s["id"] == preferred:
+                keeper = s
+                break
+        if keeper is None:
+            keeper = here[0]  # newest
+        kept[node] = keeper["id"]
+        for s in here:
+            if s["id"] != keeper["id"]:
+                cancel(s["id"], f"duplicate on {node}")
+    return kept
+
+
+# ---------------------------------------------------------------- systemd
+
+def systemctl(action: str, quiet: bool = False) -> int:
+    # sudoers grants passwordless control once install.sh ran.
+    unit = unit_name()
+    p = subprocess.run(["sudo", "-n", "systemctl", action, unit],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        # not installed yet, or no sudoers rule: fall back to an interactive prompt
+        p = subprocess.run(["sudo", "systemctl", action, unit],
+                           capture_output=True, text=True)
+    if p.returncode != 0 and not quiet:
+        sys.stderr.write(p.stdout + p.stderr)
+    return p.returncode
+
+
+def unit_active(name: str | None = None) -> bool:
+    p = subprocess.run(["systemctl", "is-active", name or unit_name()],
+                       capture_output=True, text=True)
+    return p.stdout.strip() == "active"
+
+
+def wait_for_iface(timeout: float = 40.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if unit_active():
+            p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
+            if p.returncode == 0 and p.stdout.strip():
+                return True
+        time.sleep(1)
+    return False
+
+
+# ---------------------------------------------------------------- commands
+
+def session_mode_label(cfg: dict) -> str:
+    if cfg["session_gigabytes"] > 0:
+        return f"{cfg['session_gigabytes']}GB"
+    return f"{cfg['session_hours']}h"
+
+
+def cmd_up(args):
+    cfg = load_cfg()
+    if not wallet_exists():
+        sys.exit("no wallet yet - run: dvpnctl init")
+    nodes = fetch_nodes(refresh=False)
+    node = resolve_node(cfg, args.node or cfg.get("node") or "best", nodes)
+    price_note = (f"{gb_price(node):.3f} DVPN/GB" if node.get("gb")
+                  else f"{node['hour']['quote'] / 1e6:.3f} DVPN/h")
+    print(f"endpoint: {node['moniker']} [{node['country']}] {price_note}  {node['address']}")
+
+    if args.gigabytes is not None:
+        cfg["session_gigabytes"] = args.gigabytes
+    if args.hours is not None:
+        cfg["session_hours"] = args.hours
+        cfg["session_gigabytes"] = 0
+    save_cfg(cfg)
+
+    sid = start_session(cfg, node)
+    write_session_file(sid)
+    print(f"session {sid} active; bringing up tunnel ...")
+    if systemctl("restart") != 0:
+        sys.exit("could not control dvpnctl.service - run ./install.sh (needs sudo)")
+    if not wait_for_iface():
+        sys.stderr.write("tunnel did not come up; recent logs:\n")
+        subprocess.run(["journalctl", "-u", unit_name(), "-n", "30", "--no-pager"])
+        sys.exit(1)
+    print(f"ON  {node['moniker']}  {node['country']}  "
+          f"[full tunnel + kill switch, {session_mode_label(cfg)}]")
+    cmd_status(args)
+
+
+def cmd_down(args):
+    sid = read_session_file()
+    rc = systemctl("stop", quiet=True)
+    if rc != 0:
+        print("warning: could not stop dvpnctl.service (run sudo ./install.sh)", file=sys.stderr)
+    if sid and not args.keep_session:
+        print(f"cancelling session {sid} (refunds unused deposit) ...")
+        try:
+            cancel_session(sid)
+        except SystemExit:
+            print("session cancel failed; it will expire on its own")
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+    cfg = load_cfg()
+    cfg.pop("node_moniker", None)
+    save_cfg(cfg)
+    print("OFF (kill switch removed with the tunnel)")
+
+
+def cmd_switch(args):
+    if not args.node:
+        sys.exit("usage: dvpnctl switch <#|moniker|address|best>")
+    cmd_down(argparse.Namespace(keep_session=False))
+    cmd_up(argparse.Namespace(node=args.node, gigabytes=args.gigabytes, hours=args.hours))
+
+
+def cmd_status(args):
+    cfg = load_cfg()
+    print(f"service : {'active' if unit_active() else 'inactive'} ({unit_name()})")
+    p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
+    if p.returncode == 0 and p.stdout.strip():
+        print("tunnel  : up (wg0)  kill switch: enforced by wg-quick OUTPUT rules")
+        for line in p.stdout.splitlines():
+            print("          " + line)
+    else:
+        print("tunnel  : down")
+    sid = read_session_file()
+    if sid:
+        print(f"session : {sid}  node: {cfg.get('node_moniker', cfg.get('node', '-'))}")
+    bal = balance_dvpn()
+    if bal is not None:
+        print(f"balance : {bal:.4f} DVPN")
+    addr = my_address()
+    if addr:
+        print(f"address : {addr}")
+
+
+def cmd_balance(args):
+    bal = balance_dvpn()
+    print("unknown (no LCD reachable)" if bal is None else f"{bal:.6f} DVPN")
+
+
+def cmd_fund(args):
+    addr = my_address()
+    if not addr:
+        sys.exit("no wallet yet - run: dvpnctl init")
+    print(f"Send DVPN (Sentinel, sentinelhub-2) to:\n  {addr}")
+    try:
+        nodes = fetch_nodes(refresh=False)
+        prices = sorted(gb_price(n) for n in nodes if n.get("gb"))
+        lo = prices[0] if prices else 12.5
+    except SystemExit:
+        lo = 12.5
+    print(f"\nCheapest node is ~{lo:.3f} DVPN/GB; 5 GB session deposit ~{lo * 5:.1f} "
+          f"DVPN. Fund 50-100 DVPN to start.")
+
+
+def cmd_selftest(args):
+    """Offline check of the non-trivial parsing/selection logic."""
+    sample = """
+items:
+- info:
+    service_type: wireguard
+    moniker: cheap
+    downlink: "1000000"
+    peers: 3
+    location: {country_code: DE}
+  node:
+    address: sentnode1cheap
+    gigabyte_prices:
+    - {denom: udvpn, base_value: "0.0025", quote_value: "12500000"}
+- info:
+    service_type: v2ray
+    moniker: proxy
+    downlink: "9"
+    peers: 1
+    location: {country_code: US}
+  node:
+    address: sentnode1proxy
+    gigabyte_prices:
+    - {denom: udvpn, base_value: "0.1", quote_value: "99999999"}
+"""
+    nodes = normalize_nodes(sample)
+    assert len(nodes) == 1, "v2ray node must be filtered out"
+    n = nodes[0]
+    assert gb_price(n) == 12.5, gb_price(n)
+    assert n["address"] == "sentnode1cheap"
+    cfg = dict(DEFAULTS)
+    assert best_node(cfg, nodes)["address"] == "sentnode1cheap"
+    assert max_price_str(n) == "udvpn:0.0025,12500000", max_price_str(n)
+    print("selftest OK")
+
+
+# ---------------------------------------------------------------- entrypoint
+
+def main():
+    have_yaml()
+    ap = argparse.ArgumentParser(prog="dvpnctl", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="create the wallet (once)").set_defaults(fn=cmd_init)
+    sub.add_parser("address", help="print wallet address").set_defaults(fn=cmd_address)
+    sub.add_parser("balance", help="print DVPN balance").set_defaults(fn=cmd_balance)
+    sub.add_parser("fund", help="show where to send DVPN").set_defaults(fn=cmd_fund)
+    sub.add_parser("selftest", help="run offline self-check").set_defaults(fn=cmd_selftest)
+
+    pn = sub.add_parser("nodes", help="list usable wireguard nodes")
+    pn.add_argument("-r", "--refresh", action="store_true", help="ignore cache")
+    pn.add_argument("-c", "--country", help="filter by 2-letter country code")
+    pn.add_argument("-a", "--all", action="store_true", help="ignore price cap")
+    pn.set_defaults(fn=cmd_nodes)
+
+    sub.add_parser("best", help="print the auto-selected node").set_defaults(fn=cmd_best)
+
+    def add_session_flags(p):
+        p.add_argument("-g", "--gigabytes", type=int)
+        p.add_argument("-H", "--hours", type=int)
+
+    pu = sub.add_parser("up", help="start session + full-tunnel connection")
+    pu.add_argument("node", nargs="?", help="#, moniker, address, or best")
+    add_session_flags(pu)
+    pu.set_defaults(fn=cmd_up)
+
+    pd = sub.add_parser("down", help="disconnect + remove kill switch")
+    pd.add_argument("--keep-session", action="store_true",
+                    help="do not cancel the on-chain session")
+    pd.set_defaults(fn=cmd_down)
+
+    ps = sub.add_parser("switch", help="switch endpoint")
+    ps.add_argument("node", nargs="?")
+    add_session_flags(ps)
+    ps.set_defaults(fn=cmd_switch)
+
+    sub.add_parser("status", help="show connection + balance").set_defaults(fn=cmd_status)
+
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

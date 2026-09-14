@@ -1,0 +1,34 @@
+[Unit]
+Description=Sentinel dVPN (WireGuard full tunnel + kill switch)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# A system service has no HOME, but the CLI's libraries require it.
+Environment=HOME=/root
+# dvpnctl writes these when it starts a session:
+#   DVPNCTL_SESSION_ID, DVPNCTL_RPC, DVPNCTL_CLI, DVPNCTL_ROOT_HOME, DVPNCTL_IFACE
+EnvironmentFile=-@CFG_DIR@/session.env
+# --keyring.backend test: connect signs the session handshake, so it needs the
+# wallet key, which install.sh copies into @ROOT_HOME@/keyring-test (0700 root).
+ExecStart=@CLI@ \
+    --home ${DVPNCTL_ROOT_HOME} \
+    --keyring.backend test \
+    --rpc.addrs ${DVPNCTL_RPC} \
+    --rpc.timeout 15s \
+    --log.level info \
+    connect ${DVPNCTL_SESSION_ID} \
+    --wireguard.name ${DVPNCTL_IFACE} \
+    ${DVPNCTL_EXCLUDE}
+# Safety net if the main process is killed without running wg-quick down.
+# wg-quick's PostUp already installed the fail-closed OUTPUT rules; failures
+# here are non-fatal.
+ExecStopPost=-/usr/bin/wg-quick down ${DVPNCTL_ROOT_HOME}/wireguard/${DVPNCTL_IFACE}.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
