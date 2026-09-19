@@ -9,6 +9,8 @@ wraps the official `sentinel-dvpncli` to give you:
   with restart-on-failure.
 - **One-command endpoint switching** — list cheapest/fastest nodes and jump
   between them.
+- **Speed-probed selection** — `up best` measures real throughput through the
+  top candidates before committing, and keeps the fastest.
 - **Automatic session cleanup** — stale/duplicate on-chain sessions are
   cancelled and a healthy one reused on each connect.
 
@@ -54,6 +56,20 @@ Node selectors accepted anywhere: a list index (`3`), a moniker substring
 > ⚠️ `dvpnctl init` writes your mnemonic to
 > `~/.config/dvpnctl/wallet-backup.json` (mode 600). Move it somewhere safe —
 > it is the only way to recover funds.
+
+## Speed-probed selection
+
+`dvpnctl up best` probes the top `speed_probe_count` candidates (cheapest first,
+since price is a real differentiator) by connecting to each, downloading a
+known-size payload **through the tunnel**, and measuring bytes/sec. The fastest
+measured node is kept; the rest are cancelled (unused deposit refunded). Results
+are cached for `speed_cache_ttl` so repeat connects can skip known-slow nodes.
+
+- `--no-probe` takes the first advertised-best node without measuring.
+- A node's advertised `downlink` is only a hint; the probe measures the actual
+  end-to-end path. Each probe costs a session start + cancel (a couple of
+  transactions), so keep `speed_probe_count` small.
+- Tune `speed_test_url`, `speed_test_timeout`, `speed_cache_ttl` in the config.
 
 ## Automatic failover
 
@@ -109,7 +125,11 @@ the directory with `DVPNCTL_CONFIG_DIR`). Defaults:
   "watch_url": "https://api.ipify.org",
   "watch_timeout": 8,
   "watch_fail_threshold": 3,
-  "watch_exclude_ttl": 3600
+  "watch_exclude_ttl": 3600,
+  "speed_probe_count": 3,
+  "speed_test_url": "https://speed.cloudflare.com/__down?bytes=25000000",
+  "speed_test_timeout": 20,
+  "speed_cache_ttl": 86400
 }
 ```
 

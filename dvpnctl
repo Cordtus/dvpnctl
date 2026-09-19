@@ -38,6 +38,7 @@ SESSION_FILE = os.path.join(CFG_DIR, "session.env")
 NODES_CACHE = os.path.join(CFG_DIR, "nodes.yaml")
 NODES_ORDER = os.path.join(CFG_DIR, "nodes.order")
 EXCLUDED_FILE = os.path.join(CFG_DIR, "excluded.json")  # {node_addr: unix_ts}
+SPEED_FILE = os.path.join(CFG_DIR, "speeds.json")      # {node_addr: {bps, ts}}
 WALLET_BACKUP = os.path.join(CFG_DIR, "wallet-backup.json")
 CLI_HOME = os.path.join(HOME, ".sentinel-dvpncli")
 
@@ -80,6 +81,11 @@ DEFAULTS = {
     "watch_timeout": 8,        # seconds per probe
     "watch_fail_threshold": 3,  # consecutive failures before failing over
     "watch_exclude_ttl": 3600,  # seconds a failed node stays excluded
+    # --- speed probing (dvpnctl up best) ---
+    "speed_probe_count": 3,     # top-N candidates to test before committing
+    "speed_test_url": "https://speed.cloudflare.com/__down?bytes=25000000",
+    "speed_test_timeout": 20,   # seconds for the download
+    "speed_cache_ttl": 86400,   # seconds a measured speed stays usable
 }
 
 # Subnets kept out of the tunnel when exclude_lan is true. Loopback is always
@@ -162,6 +168,60 @@ def external_ip(timeout: int = 8) -> str | None:
             return r.read().decode().strip()
     except Exception:
         return None
+
+
+def speed_cache() -> dict[str, dict]:
+    if not os.path.exists(SPEED_FILE):
+        return {}
+    try:
+        return json.load(open(SPEED_FILE))
+    except Exception:
+        return {}
+
+
+def cached_speed(addr: str, ttl: int) -> float | None:
+    e = speed_cache().get(addr)
+    if not e or time.time() - e.get("ts", 0) > ttl:
+        return None
+    return e.get("bps")
+
+
+def record_speed(addr: str, bps: float) -> None:
+    data = speed_cache()
+    data[addr] = {"bps": bps, "ts": time.time()}
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(SPEED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def measure_speed(cfg: dict) -> float | None:
+    """Download a known-size payload through the current tunnel; return bytes/sec.
+
+    Measures the real end-to-end path (the tunnel), not the node's API. Returns
+    None on failure/timeout. `TimeoutError` mid-download still yields an estimate
+    if some bytes arrived, which is useful for very slow nodes.
+    """
+    url = cfg["speed_test_url"]
+    timeout = cfg["speed_test_timeout"]
+    req = Request(url, headers={"User-Agent": "dvpnctl"})
+    start = time.time()
+    total = 0
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if time.time() - start > timeout:
+                    break
+    except Exception:
+        if total == 0:
+            return None
+    elapsed = time.time() - start
+    if elapsed <= 0 or total == 0:
+        return None
+    return total / elapsed
 
 
 def run(cmd: list[str], check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -813,15 +873,96 @@ def session_mode_label(cfg: dict) -> str:
     return f"{cfg['session_hours']}h"
 
 
+def bring_up(node: dict, cfg: dict) -> bool:
+    """Start (or reuse) a session for `node`, point the unit at it, bring the
+    tunnel up, and wait for the interface. Returns False on any failure."""
+    sid = start_session(cfg, node)
+    write_session_file(sid)
+    if systemctl("restart") != 0:
+        sys.stderr.write("could not control the tunnel unit - run ./install.sh\n")
+        return False
+    if not wait_for_iface():
+        sys.stderr.write("tunnel did not come up; recent logs:\n")
+        subprocess.run(["journalctl", "-u", unit_name(), "-n", "30", "--no-pager"])
+        return False
+    return True
+
+
+def tear_down_iface(cancel: bool = True) -> None:
+    """Stop the tunnel and (optionally) cancel the session it was using."""
+    sid = read_session_file()
+    systemctl("stop", quiet=True)
+    if cancel and sid:
+        try:
+            cancel_session(sid)
+        except SystemExit:
+            print(f"  warning: could not cancel session {sid}; it will expire")
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+
+
+def probe_candidates(cfg: dict, nodes: list[dict]) -> list[dict]:
+    """Affordable, non-excluded nodes ranked by advertised downlink, top N."""
+    exc = set(excluded_nodes())
+    candidates = [n for n in sort_nodes(nodes)
+                  if n["address"] not in exc and n.get("gb")
+                  and gb_price(n) <= cfg["max_price_per_gb"]]
+    if not candidates:
+        candidates = [n for n in sort_nodes(nodes) if n["address"] not in exc]
+    if not candidates:
+        sys.exit("no candidate nodes available")
+    return candidates[:max(1, cfg["speed_probe_count"])]
+
+
+def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tuple[dict, float | None]:
+    """Test the top candidates and keep the fastest measured one.
+
+    Each candidate is connected for real (a refundable session is escrowed then
+    cancelled for losers). Measured speeds are cached so repeat calls can skip
+    known-slow nodes. Falls back to the advertised-best node if nothing measures.
+    """
+    top = probe_candidates(cfg, nodes)
+    ranked: list[tuple[dict, float]] = []
+    for node in top:
+        cached = cached_speed(node["address"], cfg["speed_cache_ttl"])
+        if cached is not None and verbose:
+            print(f"probe {node['moniker']}: cached {cached / 1e6:.1f} MB/s")
+        else:
+            cached = None
+
+        print(f"probe {node['moniker']} [{node['country']}] ...")
+        if not bring_up(node, cfg):
+            print("  could not connect; skipping")
+            tear_down_iface(cancel=True)
+            continue
+        bps = measure_speed(cfg)
+        if bps is None:
+            print("  speed test failed; skipping")
+            tear_down_iface(cancel=True)
+            continue
+        record_speed(node["address"], bps)
+        print(f"  measured {bps / 1e6:.1f} MB/s ({bps * 8 / 1e6:.0f} Mbps)")
+        ranked.append((node, bps))
+        tear_down_iface(cancel=True)
+
+    if not ranked:
+        # nothing connected; fall back to advertised best so `up` still tries
+        node = best_node(cfg, nodes, exclude=exc)
+        print(f"no node could be measured; falling back to {node['moniker']}")
+        return node, None
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    winner, bps = ranked[0]
+    if verbose:
+        print(f"fastest: {winner['moniker']} at {bps / 1e6:.1f} MB/s")
+    return winner, bps
+
+
 def cmd_up(args):
     cfg = load_cfg()
     if not wallet_exists():
         sys.exit("no wallet yet - run: dvpnctl init")
     nodes = fetch_nodes(refresh=False)
-    node = resolve_node(cfg, args.node or cfg.get("node") or "best", nodes)
-    price_note = (f"{gb_price(node):.3f} DVPN/GB" if node.get("gb")
-                  else f"{node['hour']['quote'] / 1e6:.3f} DVPN/h")
-    print(f"endpoint: {node['moniker']} [{node['country']}] {price_note}  {node['address']}")
 
     if args.gigabytes is not None:
         cfg["session_gigabytes"] = args.gigabytes
@@ -830,14 +971,21 @@ def cmd_up(args):
         cfg["session_gigabytes"] = 0
     save_cfg(cfg)
 
-    sid = start_session(cfg, node)
-    write_session_file(sid)
-    print(f"session {sid} active; bringing up tunnel ...")
-    if systemctl("restart") != 0:
-        sys.exit("could not control dvpnctl.service - run ./install.sh (needs sudo)")
-    if not wait_for_iface():
-        sys.stderr.write("tunnel did not come up; recent logs:\n")
-        subprocess.run(["journalctl", "-u", unit_name(), "-n", "30", "--no-pager"])
+    spec = args.node or cfg.get("node") or "best"
+    bps = None
+    if spec in ("best", "auto") and not args.no_probe:
+        node, bps = probe_and_select(cfg, nodes)
+    else:
+        node = resolve_node(cfg, spec, nodes)
+
+    price_note = (f"{gb_price(node):.3f} DVPN/GB" if node.get("gb")
+                  else f"{node['hour']['quote'] / 1e6:.3f} DVPN/h")
+    speed_note = f"  {bps / 1e6:.1f} MB/s" if bps else ""
+    print(f"endpoint: {node['moniker']} [{node['country']}] {price_note}  "
+          f"{node['address']}{speed_note}")
+
+    print("bringing up tunnel ...")
+    if not bring_up(node, cfg):
         sys.exit(1)
     print(f"ON  {node['moniker']}  {node['country']}  "
           f"[full tunnel + kill switch, {session_mode_label(cfg)}]")
@@ -867,7 +1015,7 @@ def cmd_switch(args):
     if not args.node:
         sys.exit("usage: dvpnctl switch <#|moniker|address|best>")
     cmd_down(argparse.Namespace(keep_session=False))
-    cmd_up(argparse.Namespace(node=args.node, gigabytes=args.gigabytes, hours=args.hours))
+    cmd_up(argparse.Namespace(node=args.node, gigabytes=args.gigabytes, hours=args.hours, no_probe=True))
 
 
 def cmd_status(args):
@@ -1009,7 +1157,7 @@ def cmd_watch(args):
         clear_exclusions()
         node = best_node(cfg, nodes)
     print(f"watch: failing over to {node['moniker']} [{node['country']}]")
-    cmd_up(argparse.Namespace(node=node["address"], gigabytes=None, hours=None))
+    cmd_up(argparse.Namespace(node=node["address"], gigabytes=None, hours=None, no_probe=True))
 
 
 def cmd_selftest(args):
@@ -1048,6 +1196,37 @@ items:
         "single-node fallback ignores exclusion only when nothing else remains"
     assert max_price_str(n) == "udvpn:0.0025,12500000", max_price_str(n)
 
+    # candidate ranking honours the exclusion set and the price cap
+    sample3 = sample + """
+- info:
+    service_type: wireguard
+    moniker: fast
+    downlink: "9000000"
+    peers: 1
+    location: {country_code: NL}
+  node:
+    address: sentnode1fast
+    gigabyte_prices:
+    - {denom: udvpn, base_value: "0.0025", quote_value: "13000000"}
+- info:
+    service_type: wireguard
+    moniker: pricey
+    downlink: "99000000"
+    peers: 1
+    location: {country_code: JP}
+  node:
+    address: sentnode1pricey
+    gigabyte_prices:
+    - {denom: udvpn, base_value: "1.0", quote_value: "999000000"}
+"""
+    allnodes = normalize_nodes(sample3)
+    ranked = probe_candidates({**DEFAULTS, "speed_probe_count": 5}, allnodes)
+    # candidates are cheapest-first (probe then measures actual speed)
+    assert ranked[0]["address"] == "sentnode1cheap", [n["address"] for n in ranked]
+    assert "sentnode1fast" in [n["address"] for n in ranked]
+    assert all(n["address"] != "sentnode1pricey" for n in ranked), \
+        "above-cap node must be excluded"
+
     # node-id extraction from a tx event payload
     tx = ('{"result":{"tx_result":{"log":"[{\\"events\\":[{\\"type\\":'
           '\\"sentinel.session.v3.EventCreateSession\\",\\"attributes\\":'
@@ -1084,6 +1263,8 @@ def main():
 
     pu = sub.add_parser("up", help="start session + full-tunnel connection")
     pu.add_argument("node", nargs="?", help="#, moniker, address, or best")
+    pu.add_argument("--no-probe", action="store_true",
+                    help="skip speed probing; take the first advertised-best node")
     add_session_flags(pu)
     pu.set_defaults(fn=cmd_up)
 
