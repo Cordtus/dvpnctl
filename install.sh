@@ -99,6 +99,13 @@ sed -e "s|@CFG_DIR@|$CFG_DIR|g" -e "s|@ROOT_HOME@|$ROOT_HOME|g" \
 chmod 644 "/etc/systemd/system/$UNIT"
 install -d -m700 "$ROOT_HOME"
 
+# watchdog: oneshot health probe + timer (opt-in; `systemctl enable --now`)
+sed -e "s|@CFG_DIR@|$CFG_DIR|g" -e "s|@TARGET_HOME@|$TARGET_HOME|g" \
+    -e "s|@TARGET_USER@|$TARGET_USER|g" \
+    "$HERE/systemd/dvpnctl-watch.service" > /etc/systemd/system/dvpnctl-watch.service
+cp "$HERE/systemd/dvpnctl-watch.timer" /etc/systemd/system/dvpnctl-watch.timer
+chmod 644 /etc/systemd/system/dvpnctl-watch.service /etc/systemd/system/dvpnctl-watch.timer
+
 # --- 3. root keyring ------------------------------------------------------
 # `connect` signs the session handshake, so the unit needs the wallet key. The
 # "test" backend stores it under $ROOT_HOME (0700, root-only), no passphrase.
@@ -146,3 +153,4 @@ systemctl reset-failed "$UNIT" 2>/dev/null || true
 
 echo "installed."
 echo "next: as $TARGET_USER run  dvpnctl init  (once),  dvpnctl fund,  dvpnctl up best"
+echo "optional auto-failover watchdog:  sudo systemctl enable --now dvpnctl-watch.timer"

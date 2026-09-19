@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic dVPN health probe + auto-failover
+After=dvpnctl.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+Unit=dvpnctl-watch.service
+
+[Install]
+WantedBy=timers.target

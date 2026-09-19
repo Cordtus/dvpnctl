@@ -1,0 +1,11 @@
+[Unit]
+Description=dVPN health probe + auto-failover
+After=dvpnctl.service
+
+[Service]
+Type=oneshot
+# Run as the user whose keyring/config are in @CFG_DIR@, but the unit needs to
+# stop/start the tunnel, so it runs as root via the installed sudoers rule.
+User=@TARGET_USER@
+Environment=HOME=@TARGET_HOME@
+ExecStart=/usr/local/bin/dvpnctl watch

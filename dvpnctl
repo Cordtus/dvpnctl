@@ -37,6 +37,7 @@ CFG_FILE = os.path.join(CFG_DIR, "config.json")
 SESSION_FILE = os.path.join(CFG_DIR, "session.env")
 NODES_CACHE = os.path.join(CFG_DIR, "nodes.yaml")
 NODES_ORDER = os.path.join(CFG_DIR, "nodes.order")
+EXCLUDED_FILE = os.path.join(CFG_DIR, "excluded.json")  # {node_addr: unix_ts}
 WALLET_BACKUP = os.path.join(CFG_DIR, "wallet-backup.json")
 CLI_HOME = os.path.join(HOME, ".sentinel-dvpncli")
 
@@ -74,6 +75,11 @@ DEFAULTS = {
     "iface": "wg0",
     "exclude_lan": True,       # keep RFC1918/loopback out of the tunnel
     "node": "",                # last selected node address (internal)
+    # --- watchdog (dvpnctl watch) ---
+    "watch_url": "https://api.ipify.org",  # fetched through the tunnel
+    "watch_timeout": 8,        # seconds per probe
+    "watch_fail_threshold": 3,  # consecutive failures before failing over
+    "watch_exclude_ttl": 3600,  # seconds a failed node stays excluded
 }
 
 # Subnets kept out of the tunnel when exclude_lan is true. Loopback is always
@@ -121,6 +127,41 @@ def iface() -> str:
 
 def cli_home() -> str:
     return load_cfg()["cli_home"]
+
+
+def excluded_nodes() -> dict[str, float]:
+    """Nodes the watchdog is temporarily avoiding: {address: expiry_unix}."""
+    if not os.path.exists(EXCLUDED_FILE):
+        return {}
+    try:
+        data = json.load(open(EXCLUDED_FILE))
+    except Exception:
+        return {}
+    now = time.time()
+    return {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > now}
+
+
+def exclude_node(addr: str, ttl: int) -> None:
+    data = excluded_nodes()
+    data[addr] = time.time() + ttl
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(EXCLUDED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def clear_exclusions() -> None:
+    if os.path.exists(EXCLUDED_FILE):
+        os.remove(EXCLUDED_FILE)
+
+
+def external_ip(timeout: int = 8) -> str | None:
+    """Return this host's public IP as seen from the current routing."""
+    try:
+        req = Request("https://api.ipify.org", headers={"User-Agent": "dvpnctl"})
+        with urlopen(req, timeout=timeout) as r:
+            return r.read().decode().strip()
+    except Exception:
+        return None
 
 
 def run(cmd: list[str], check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -356,12 +397,16 @@ def max_price_str(node: dict) -> str:
     return f"udvpn:{p['base']},{p['quote']}"
 
 
-def best_node(cfg: dict, nodes: list[dict]) -> dict:
-    cap = cfg["max_price_per_gb"]
+def best_node(cfg: dict, nodes: list[dict], exclude: set[str] | None = None) -> dict:
+    exclude = exclude or set()
     pool = [n for n in nodes
-            if n.get("gb") and gb_price(n) <= cap and n["peers"] <= cfg["max_peers"]]
+            if n["address"] not in exclude
+            and n.get("gb") and gb_price(n) <= cfg["max_price_per_gb"]
+            and n["peers"] <= cfg["max_peers"]]
     if not pool:
-        pool = [n for n in nodes if n.get("gb")] or nodes
+        pool = [n for n in nodes if n["address"] not in exclude and n.get("gb")]
+    if not pool:
+        pool = [n for n in nodes if n["address"] not in exclude] or nodes
     return max(pool, key=lambda n: n["downlink"])
 
 
@@ -477,17 +522,40 @@ def find_active_session(addr: str, node: str, timeout: float = 20.0) -> int | No
 
 
 def tx_session_id(text: str) -> int | None:
-    """Pull the session id from a tx's own events (authoritative, no stale read)."""
+    """Pull the session id from a tx's own events (authoritative, no stale read).
+
+    The events live inside `tx_result.log`, which is itself a JSON-encoded
+    string, so walk both the outer object and any JSON strings found within.
+    """
     data = extract_json(text)
     if not data:
         return None
     ids = []
-    for d in walk(data):
-        if d.get("key") == "session_id":
-            v = str(d.get("value", "")).strip('"')
-            if v.isdigit():
-                ids.append(int(v))
+    for blob in _json_strings(data):
+        for d in walk(blob):
+            if d.get("key") == "session_id":
+                v = str(d.get("value", "")).strip('"')
+                if v.isdigit():
+                    ids.append(int(v))
     return max(ids) if ids else None
+
+
+def _json_strings(obj):
+    """Yield obj plus any embedded JSON string values (one level of nesting)."""
+    yield obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _json_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _json_strings(v)
+    elif isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in "[{":
+            try:
+                yield json.loads(s)
+            except json.JSONDecodeError:
+                pass
 
 
 def start_session(cfg: dict, node: dict, reconcile: bool = True) -> int:
@@ -843,6 +911,107 @@ def cmd_fund(args):
           f"DVPN. Fund 50-100 DVPN to start.")
 
 
+def cmd_verify(args):
+    """Prove that traffic is actually tunneled: routing, firewall, and exit IP."""
+    cfg = load_cfg()
+    up = unit_active() and _iface_up()
+    ok = True
+
+    print(f"interface : {iface()} {'up' if _iface_up() else 'DOWN'}")
+    if not _iface_up():
+        ok = False
+
+    # ip rules: wg-quick default-route mode adds a `not fwmark` rule + suppress
+    rules = subprocess.run(["ip", "rule"], capture_output=True, text=True).stdout
+    has_rule = "suppress_prefixlength 0" in rules
+    print(f"ip rules  : {'default-route rules present' if has_rule else 'MISSING'}")
+    ok &= has_rule
+
+    # firewall: the SDK's fail-closed OUTPUT DROP must exist for the interface
+    for tool in ("iptables", "ip6tables"):
+        out = subprocess.run(["sudo", "-n", tool, "-S", "OUTPUT"],
+                             capture_output=True, text=True)
+        text = out.stdout if out.returncode == 0 else ""
+        drop = any(iface() in l and "DROP" in l for l in text.splitlines())
+        print(f"{tool:<9} : {'kill-switch DROP present' if drop else 'not readable/MISSING'}")
+        if not text:
+            # can't inspect without sudo; don't fail the check, just note it
+            continue
+        ok &= drop
+
+    # exit IP: with the tunnel up it must differ from the direct path
+    direct = external_ip(cfg["watch_timeout"])
+    print(f"exit IP   : {direct or 'unreachable'}")
+    if up and direct is None:
+        ok = False
+
+    if up:
+        gw = subprocess.run(["wg", "show", iface(), "endpoints"],
+                            capture_output=True, text=True).stdout.strip()
+        print(f"peer      : {gw or '-'}")
+    print("RESULT    : " + ("tunneled (all host traffic exits the node, or is dropped)"
+                            if ok else "NOT fully verified"))
+    sys.exit(0 if ok else 1)
+
+
+def _iface_up() -> bool:
+    p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
+def cmd_watch(args):
+    """Health probe; fail over to another node after repeated failures.
+
+    Designed to run from a systemd timer. Exits 0 when healthy (or when no
+    tunnel is up), non-zero only on an unexpected internal error.
+    """
+    cfg = load_cfg()
+    if not _iface_up():
+        print("watch: tunnel down, nothing to do")
+        return
+    fails_file = os.path.join(CFG_DIR, "watch.fails")
+    fails = int(open(fails_file).read().strip() or 0) if os.path.exists(fails_file) else 0
+
+    probe = external_ip(cfg["watch_timeout"])
+    if probe:
+        if fails:
+            print("watch: recovered")
+        if os.path.exists(fails_file):
+            os.remove(fails_file)
+        return
+
+    fails += 1
+    print(f"watch: probe failed ({fails}/{cfg['watch_fail_threshold']})")
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(fails_file, "w") as f:
+        f.write(str(fails))
+    if fails < cfg["watch_fail_threshold"]:
+        return
+
+    cur = cfg.get("node")
+    if cur:
+        exclude_node(cur, cfg["watch_exclude_ttl"])
+        print(f"watch: excluding {cur} for {cfg['watch_exclude_ttl']}s")
+
+    # tear down the bad tunnel, then bring up the best non-excluded node
+    subprocess.run(["sudo", "-n", "systemctl", "stop", unit_name()],
+                   capture_output=True)
+    if os.path.exists(fails_file):
+        os.remove(fails_file)
+    nodes = fetch_nodes(refresh=True)
+    exc = set(excluded_nodes())
+    if not nodes:
+        print("watch: no nodes available to fail over to", file=sys.stderr)
+        sys.exit(1)
+    node = best_node(cfg, nodes, exclude=exc)
+    if node["address"] in exc:
+        print("watch: every node is excluded; clearing exclusions")
+        clear_exclusions()
+        node = best_node(cfg, nodes)
+    print(f"watch: failing over to {node['moniker']} [{node['country']}]")
+    cmd_up(argparse.Namespace(node=node["address"], gigabytes=None, hours=None))
+
+
 def cmd_selftest(args):
     """Offline check of the non-trivial parsing/selection logic."""
     sample = """
@@ -875,7 +1044,16 @@ items:
     assert n["address"] == "sentnode1cheap"
     cfg = dict(DEFAULTS)
     assert best_node(cfg, nodes)["address"] == "sentnode1cheap"
+    assert best_node(cfg, nodes, exclude={"sentnode1cheap"})["address"] == "sentnode1cheap", \
+        "single-node fallback ignores exclusion only when nothing else remains"
     assert max_price_str(n) == "udvpn:0.0025,12500000", max_price_str(n)
+
+    # node-id extraction from a tx event payload
+    tx = ('{"result":{"tx_result":{"log":"[{\\"events\\":[{\\"type\\":'
+          '\\"sentinel.session.v3.EventCreateSession\\",\\"attributes\\":'
+          '[{\\"key\\":\\"session_id\\",\\"value\\":\\"61151809\\"}]}]}]"}}}')
+    assert tx_session_id(tx) == 61151809, tx_session_id(tx)
+    assert tx_session_id("garbage") is None
     print("selftest OK")
 
 
@@ -920,7 +1098,10 @@ def main():
     ps.set_defaults(fn=cmd_switch)
 
     sub.add_parser("status", help="show connection + balance").set_defaults(fn=cmd_status)
-
+    sub.add_parser("verify", help="prove traffic is tunneled (routing/firewall/exit IP)"
+                   ).set_defaults(fn=cmd_verify)
+    sub.add_parser("watch", help="health probe + auto-failover (run from a timer)"
+                   ).set_defaults(fn=cmd_watch)
 
     args = ap.parse_args()
     args.fn(args)

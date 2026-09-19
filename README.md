@@ -44,6 +44,7 @@ dvpnctl nodes         # list usable WireGuard endpoints by price/speed
 dvpnctl up best       # start a session + full tunnel + kill switch
 dvpnctl switch kfmg   # jump to a better endpoint
 dvpnctl status        # tunnel, session, balance
+dvpnctl verify        # prove traffic is tunneled (routing, firewall, exit IP)
 dvpnctl down          # deactivate (cancels the session, refunds unused deposit)
 ```
 
@@ -53,6 +54,20 @@ Node selectors accepted anywhere: a list index (`3`), a moniker substring
 > ⚠️ `dvpnctl init` writes your mnemonic to
 > `~/.config/dvpnctl/wallet-backup.json` (mode 600). Move it somewhere safe —
 > it is the only way to recover funds.
+
+## Automatic failover
+
+`dvpnctl watch` probes through the tunnel and, after `watch_fail_threshold`
+consecutive failures, excludes the current node and reconnects to the best
+remaining one. Enable it as a timer (opt-in):
+
+```bash
+sudo systemctl enable --now dvpnctl-watch.timer   # probes every 30s
+```
+
+It is a no-op when the tunnel is down. A failed node stays excluded for
+`watch_exclude_ttl` seconds. Tune `watch_url`, `watch_timeout`,
+`watch_fail_threshold`, and `watch_exclude_ttl` in the config.
 
 ## Kill switch
 
@@ -90,7 +105,11 @@ the directory with `DVPNCTL_CONFIG_DIR`). Defaults:
   "unit_name": "dvpnctl.service",
   "root_home": "/var/lib/dvpnctl",
   "iface": "wg0",
-  "exclude_lan": true
+  "exclude_lan": true,
+  "watch_url": "https://api.ipify.org",
+  "watch_timeout": 8,
+  "watch_fail_threshold": 3,
+  "watch_exclude_ttl": 3600
 }
 ```
 
@@ -117,6 +136,7 @@ the directory with `DVPNCTL_CONFIG_DIR`). Defaults:
 | `dvpnctl` | the controller (Python 3) |
 | `install.sh` | one-time root install |
 | `systemd/dvpnctl.service` | unit that owns the tunnel |
+| `systemd/dvpnctl-watch.{service,timer}` | optional failover watchdog |
 | `~/.config/dvpnctl/config.json` | tunables |
 | `~/.config/dvpnctl/wallet-backup.json` | mnemonic — keep safe |
 
