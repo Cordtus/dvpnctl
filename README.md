@@ -60,19 +60,39 @@ Node selectors accepted anywhere: a list index (`3`), a moniker substring
 > address); re-run `sudo ./install.sh <user>` afterwards so the root service
 > keyring is seeded.
 
-## Speed-probed selection
+## Node selection
 
-`dvpnctl up best` probes the top `speed_probe_count` candidates (cheapest first,
-since price is a real differentiator) by connecting to each, downloading a
-known-size payload **through the tunnel**, and measuring bytes/sec. The fastest
-measured node is kept; the rest are cancelled (unused deposit refunded). Results
-are cached for `speed_cache_ttl` so repeat connects can skip known-slow nodes.
+**Source.** Active nodes are pulled from the chain (`query nodes --status
+active`), filtered to `service_type == wireguard` and to nodes that quote a
+`udvpn` price. Self-reported fields read: advertised `downlink`, `uplink`,
+`peers`, location, and gigabyte/hourly pricing.
+
+**Shortlist.** Nodes are ranked cheapest-first, then by advertised downlink. A
+node is eligible for auto-selection if it is at or below `max_price_per_gb`
+(15 DVPN/GB), has at most `max_peers` (60) peers, and is not in the temporary
+watchdog exclusion list.
+
+**Advertised pick.** `best_node` takes the highest advertised downlink from the
+eligible set, with fallbacks: if nothing meets price/peer limits, drop the
+limits; if nothing has GB pricing, fall back to time-priced nodes; last resort,
+ignore exclusions.
+
+**Measured pick.** `up best` takes the top `speed_probe_count` (3) candidates
+from the shortlist, connects to each for real, downloads a known-size payload
+through the tunnel, and keeps the fastest measured. Losers are cancelled and
+their deposits refunded. Measurements are cached for `speed_cache_ttl` (24h),
+and a fresh cache entry is reused rather than re-probed.
+
+**Persistent signals.** Measured throughput (`speeds.json`), watchdog exclusions
+(`excluded.json`) for nodes that failed health probes, and a cached ranking
+(`nodes.order`) backing numeric selectors.
 
 - `--no-probe` takes the first advertised-best node without measuring.
 - A node's advertised `downlink` is only a hint; the probe measures the actual
   end-to-end path. Each probe costs a session start + cancel (a couple of
   transactions), so keep `speed_probe_count` small.
-- Tune `speed_test_url`, `speed_test_timeout`, `speed_cache_ttl` in the config.
+- Tune `speed_probe_count`, `speed_test_url`, `speed_test_timeout`,
+  `speed_cache_ttl`, `max_price_per_gb`, and `max_peers` in the config.
 
 ## Automatic failover
 
