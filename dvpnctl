@@ -1076,11 +1076,54 @@ def cmd_up(args):
     cmd_status(args)
 
 
+def human_bytes(n: int) -> str:
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f} KB"
+    return f"{n} B"
+
+
+def session_report(sid: int) -> str | None:
+    """One-line bandwidth/cost summary for a session, read from the chain."""
+    import yaml
+    data = yaml.safe_load(cli(["query", "session", str(sid)], rpc=True)) or {}
+    s = data.get("base_session") or {}
+    if "download_bytes" not in s:
+        s = next((d for d in walk(data) if "download_bytes" in d), {})
+    price = data.get("price") or next(
+        (d for d in walk(data) if "quote_value" in d), {})
+    if "download_bytes" not in s:
+        return None
+
+    down = int(s.get("download_bytes") or 0)
+    up = int(s.get("upload_bytes") or 0)
+    used = down + up
+    quote = int(price.get("quote_value") or 0)  # udvpn per GB
+    max_bytes = int(s.get("max_bytes") or 0)
+    cost = used / 1e9 * quote / 1e6
+    escrow = max_bytes / 1e9 * quote / 1e6
+    parts = [f"{human_bytes(used)} used ({human_bytes(down)} down, "
+             f"{human_bytes(up)} up), cost ~{cost:.4f} DVPN"]
+    if escrow:
+        parts.append(f"refund ~{escrow - cost:.4f} of {escrow:.4f} DVPN escrowed")
+    return f"session {sid}: " + ", ".join(parts)
+
+
 def cmd_down(args):
     sid = read_session_file()
     rc = systemctl("stop", quiet=True)
     if rc != 0:
         print("warning: could not stop dvpnctl.service (run sudo ./install.sh)", file=sys.stderr)
+    if sid:
+        try:
+            report = session_report(sid)
+        except SystemExit:
+            report = None
+        if report:
+            print(report)
     if sid and not args.keep_session:
         print(f"cancelling session {sid} (refunds unused deposit) ...")
         try:

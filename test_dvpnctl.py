@@ -87,6 +87,22 @@ def test_session_file_exclude_flags(m, tmp):
     assert open(m.SESSION_FILE).read().count("--wireguard.exclude-addrs=") == 2
 
 
+def test_session_report(m):
+    m.cli = lambda *a, **k: (
+        "base_session:\n"
+        "  download_bytes: \"341079180\"\n"
+        "  upload_bytes: \"591056848\"\n"
+        "  id: 6.2861151e+07\n"
+        "  max_bytes: \"5000000000\"\n"
+        "price:\n"
+        "  quote_value: \"12500000\"\n")
+    m.human_bytes = lambda n: f"{n}B"
+    report = m.session_report(62861151)
+    assert report.startswith("session 62861151: "), report
+    assert "cost ~11.6517 DVPN" in report, report
+    assert "refund ~50.8483 of 62.5000 DVPN escrowed" in report, report
+
+
 def test_recover_backup_rejects_mismatch(m, tmp):
     import os
     m.CFG_DIR = tmp

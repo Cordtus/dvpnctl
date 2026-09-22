@@ -167,7 +167,8 @@ the directory with `DVPNCTL_CONFIG_DIR`). Defaults:
   WireGuard nodes are currently ~12.5 DVPN/GB). The rest of the wallet is
   untouched — funds are never sent to the node up front.
 - On `down` (or session timeout) the node is paid only for measured usage and
-  **`deposit − usage` is refunded**.
+  **`deposit − usage` is refunded**. `dvpnctl down` prints a one-line report for
+  the session it cancels: data used (down/up), cost, and the expected refund.
 - The most a misbehaving node can take is one session's deposit. Keep
   `session_gigabytes` small to cap that, and cycle sessions rather than opening
   one huge one.
