@@ -20,12 +20,14 @@ Tunables live in ~/.config/dvpnctl/config.json (see DEFAULTS below).
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.request import Request, urlopen
 
@@ -87,11 +89,6 @@ DEFAULTS = {
     "speed_test_timeout": 20,   # seconds for the download
     "speed_cache_ttl": 86400,   # seconds a measured speed stays usable
 }
-
-# Subnets kept out of the tunnel when exclude_lan is true. Loopback is always
-# excluded; the rest are the private ranges a LAN needs to stay reachable.
-LAN_EXCLUDES = ["127.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12",
-                "10.0.0.0/8", "::1/128", "fe80::/10", "fd00::/8"]
 
 NODES_CACHE_TTL = 3600  # seconds; `dvpnctl nodes -r` forces a refresh
 
@@ -224,10 +221,19 @@ def measure_speed(cfg: dict) -> float | None:
     return total / elapsed
 
 
+# The CLI emits a harmless sonic/ast fallback warning on stderr before real
+# errors; drop it so it does not bury the actual message.
+SONIC_NOISE = "sonic/ast only supports"
+
+
+def clean_stderr(text: str) -> str:
+    return "".join(l for l in text.splitlines(keepends=True) if SONIC_NOISE not in l)
+
+
 def run(cmd: list[str], check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
     p = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
     if check and p.returncode != 0:
-        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        sys.stderr.write((p.stdout or "") + clean_stderr(p.stderr or ""))
         sys.exit(p.returncode)
     return p
 
@@ -248,7 +254,7 @@ def cli(args: list[str], check: bool = True, stdin: str | None = None,
         if p.returncode == 0:
             return p.stdout
     if check and p is not None:
-        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        sys.stderr.write((p.stdout or "") + clean_stderr(p.stderr or ""))
         sys.exit(p.returncode)
     return p.stdout if p is not None else ""
 
@@ -271,12 +277,12 @@ def tx_with_retry(args: list[str], verify) -> str:
         if p.returncode == 0:
             return p.stdout
         last = p
-        sys.stderr.write((p.stdout or "") + (p.stderr or ""))
+        sys.stderr.write((p.stdout or "") + clean_stderr(p.stderr or ""))
         time.sleep(3)
         if verify():
             print("transaction landed despite the RPC error; continuing")
             return ""
-    sys.stderr.write((last.stdout or "") + (last.stderr or "") if last else "")
+    sys.stderr.write((last.stdout or "") + clean_stderr(last.stderr or "") if last else "")
     sys.exit("transaction failed on all RPC endpoints")
 
 
@@ -339,9 +345,48 @@ def wallet_exists() -> bool:
     return my_address() is not None
 
 
+def derive_address(mnemonic: str) -> str | None:
+    """Address for a mnemonic, derived in a throwaway in-memory keyring."""
+    tmp = tempfile.mkdtemp(prefix="dvpnctl-keycheck-")
+    try:
+        out = cli(["--home", tmp, "--keyring.backend", "memory",
+                   "keys", "add", "probe", "--output-format", "json"],
+                  check=False, stdin=f"{mnemonic}\n\n")
+        data = extract_json(out)
+        return data.get("address") if isinstance(data, dict) else None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def recover_backup() -> None:
+    """Recreate wallet-backup.json from the mnemonic when it was moved away.
+
+    install.sh needs this file to seed the root service keyring, but `init`
+    would otherwise refuse because the wallet already exists.
+    """
+    addr = my_address()
+    print(f"wallet {addr} exists but its mnemonic backup is missing:")
+    print(f"  {WALLET_BACKUP}")
+    print("Enter the wallet mnemonic to recreate it (hidden; Ctrl-C aborts).")
+    mnemonic = getpass.getpass("mnemonic: ").strip()
+    if not mnemonic:
+        sys.exit("no mnemonic entered; nothing written")
+    if derive_address(mnemonic) != addr:
+        sys.exit("that mnemonic does not match this wallet's address; nothing written")
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    with open(WALLET_BACKUP, "w") as f:
+        json.dump({"name": load_cfg()["key_name"], "address": addr, "mnemonic": mnemonic}, f, indent=2)
+    os.chmod(WALLET_BACKUP, 0o600)
+    print(f"backup written to {WALLET_BACKUP} (mode 600).")
+    print("Now re-run:  sudo ./install.sh <user>  to seed the root service keyring.")
+
+
 def cmd_init(args):
     if wallet_exists():
-        print(f"wallet already exists: {my_address()}")
+        if os.path.exists(WALLET_BACKUP):
+            print(f"wallet already exists: {my_address()}")
+            return
+        recover_backup()
         return
     # keys add prompts for a mnemonic then a bip39 passphrase; blank lines accept defaults.
     out = cli_keys(["add", load_cfg()["key_name"], "--output-format", "json"],
@@ -685,9 +730,13 @@ def session_active(v) -> bool:
 
 
 def cancel_session(sid: int, wait: bool = False) -> None:
+    # A cancelled session lingers as inactive_pending for a block or two, and
+    # cancelling it again is rejected with an "invalid status" error. Skip the
+    # tx when it is already inactive (or gone).
+    if not session_active(session_status(sid)):
+        return
     tx_with_retry(["session-cancel", str(sid)],
-                  lambda: session_status(sid) is not None
-                  and not session_active(session_status(sid)))
+                  lambda: not session_active(session_status(sid)))
     if wait:
         # cancel only marks inactive_pending; the chain deletes it a block or
         # two later. Wait until it is gone so a new session gets a new id.
@@ -735,9 +784,13 @@ def write_session_file(sid: int) -> None:
         f.write(f"DVPNCTL_ROOT_HOME={cfg['root_home']}\n")
         f.write(f"DVPNCTL_IFACE={cfg['iface']}\n")
         if cfg["exclude_lan"]:
-            f.write(f"DVPNCTL_EXCLUDE=--wireguard.exclude-addrs={','.join(LAN_EXCLUDES)}\n")
+            # The engine already excludes loopback + RFC1918 by default.
+            f.write("DVPNCTL_EXCLUDE=\n")
         else:
-            f.write("DVPNCTL_EXCLUDE=--wireguard.exclude-addrs=127.0.0.0/8,::1/128\n")
+            # stringArray flag: one prefix per occurrence (no comma joining), and
+            # the unit word-splits $DVPNCTL_EXCLUDE into separate args.
+            f.write("DVPNCTL_EXCLUDE=--wireguard.exclude-addrs=127.0.0.0/8 "
+                    "--wireguard.exclude-addrs=::1/128\n")
 
 
 def read_session_file() -> int | None:
@@ -834,18 +887,24 @@ def reconcile_sessions(wanted: dict[str, int]) -> dict[str, int]:
 
 # ---------------------------------------------------------------- systemd
 
-def systemctl(action: str, quiet: bool = False) -> int:
+def systemctl(action: str, quiet: bool = False, interactive: bool = True) -> int:
     # sudoers grants passwordless control once install.sh ran.
     unit = unit_name()
     p = subprocess.run(["sudo", "-n", "systemctl", action, unit],
                        capture_output=True, text=True)
-    if p.returncode != 0:
+    if p.returncode != 0 and interactive:
         # not installed yet, or no sudoers rule: fall back to an interactive prompt
         p = subprocess.run(["sudo", "systemctl", action, unit],
                            capture_output=True, text=True)
     if p.returncode != 0 and not quiet:
         sys.stderr.write(p.stdout + p.stderr)
     return p.returncode
+
+
+def unit_installed() -> bool:
+    p = subprocess.run(["systemctl", "cat", unit_name()],
+                       capture_output=True, text=True)
+    return p.returncode == 0
 
 
 def unit_active(name: str | None = None) -> bool:
@@ -876,10 +935,17 @@ def session_mode_label(cfg: dict) -> str:
 def bring_up(node: dict, cfg: dict) -> bool:
     """Start (or reuse) a session for `node`, point the unit at it, bring the
     tunnel up, and wait for the interface. Returns False on any failure."""
+    # Check the unit first: without it we would escrow a session only to fail.
+    if not unit_installed():
+        sys.stderr.write(f"tunnel unit {unit_name()} is not installed - run ./install.sh\n")
+        return False
     sid = start_session(cfg, node)
     write_session_file(sid)
+    # A previous failed connect can leave the unit in systemd's start-limit-hit
+    # state, which refuses further starts for two minutes; clear it first.
+    systemctl("reset-failed", quiet=True, interactive=False)
     if systemctl("restart") != 0:
-        sys.stderr.write("could not control the tunnel unit - run ./install.sh\n")
+        sys.stderr.write("could not start the tunnel unit\n")
         return False
     if not wait_for_iface():
         sys.stderr.write("tunnel did not come up; recent logs:\n")
@@ -921,14 +987,20 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
     cancelled for losers). Measured speeds are cached so repeat calls can skip
     known-slow nodes. Falls back to the advertised-best node if nothing measures.
     """
+    if not unit_installed():
+        node = best_node(cfg, nodes, exclude=set(excluded_nodes()))
+        print(f"tunnel unit {unit_name()} is not installed; run ./install.sh")
+        return node, None
+
     top = probe_candidates(cfg, nodes)
     ranked: list[tuple[dict, float]] = []
     for node in top:
         cached = cached_speed(node["address"], cfg["speed_cache_ttl"])
-        if cached is not None and verbose:
-            print(f"probe {node['moniker']}: cached {cached / 1e6:.1f} MB/s")
-        else:
-            cached = None
+        if cached is not None:
+            if verbose:
+                print(f"probe {node['moniker']}: cached {cached / 1e6:.1f} MB/s")
+            ranked.append((node, cached))
+            continue
 
         print(f"probe {node['moniker']} [{node['country']}] ...")
         if not bring_up(node, cfg):
@@ -947,7 +1019,7 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
 
     if not ranked:
         # nothing connected; fall back to advertised best so `up` still tries
-        node = best_node(cfg, nodes, exclude=exc)
+        node = best_node(cfg, nodes, exclude=set(excluded_nodes()))
         print(f"no node could be measured; falling back to {node['moniker']}")
         return node, None
 

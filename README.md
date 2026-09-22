@@ -55,7 +55,10 @@ Node selectors accepted anywhere: a list index (`3`), a moniker substring
 
 > ⚠️ `dvpnctl init` writes your mnemonic to
 > `~/.config/dvpnctl/wallet-backup.json` (mode 600). Move it somewhere safe —
-> it is the only way to recover funds.
+> it is the only way to recover funds. If you move it away, `dvpnctl init`
+> prompts for the mnemonic and recreates it (verified against the wallet
+> address); re-run `sudo ./install.sh <user>` afterwards so the root service
+> keyring is seeded.
 
 ## Speed-probed selection
 

@@ -22,7 +22,7 @@ ExecStart=@CLI@ \
     --log.level info \
     connect ${DVPNCTL_SESSION_ID} \
     --wireguard.name ${DVPNCTL_IFACE} \
-    ${DVPNCTL_EXCLUDE}
+    $DVPNCTL_EXCLUDE
 # Safety net if the main process is killed without running wg-quick down.
 # wg-quick's PostUp already installed the fail-closed OUTPUT rules; failures
 # here are non-fatal.
