@@ -913,13 +913,25 @@ def unit_active(name: str | None = None) -> bool:
     return p.stdout.strip() == "active"
 
 
+def iface_exists() -> bool:
+    """Kernel view of the interface; `wg show` needs root, sysfs does not."""
+    return os.path.exists(f"/sys/class/net/{iface()}")
+
+
+def wg_show(*args: str) -> str:
+    """`wg show` output, or '' if unreadable. Needs root; tries passwordless sudo."""
+    base = ["wg", "show", iface(), *args]
+    p = subprocess.run(base, capture_output=True, text=True)
+    if p.returncode != 0:
+        p = subprocess.run(["sudo", "-n", *base], capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else ""
+
+
 def wait_for_iface(timeout: float = 40.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if unit_active():
-            p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
-            if p.returncode == 0 and p.stdout.strip():
-                return True
+        if unit_active() and iface_exists():
+            return True
         time.sleep(1)
     return False
 
@@ -1093,10 +1105,9 @@ def cmd_switch(args):
 def cmd_status(args):
     cfg = load_cfg()
     print(f"service : {'active' if unit_active() else 'inactive'} ({unit_name()})")
-    p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
-    if p.returncode == 0 and p.stdout.strip():
+    if iface_exists():
         print("tunnel  : up (wg0)  kill switch: enforced by wg-quick OUTPUT rules")
-        for line in p.stdout.splitlines():
+        for line in wg_show().splitlines():
             print("          " + line)
     else:
         print("tunnel  : down")
@@ -1166,8 +1177,7 @@ def cmd_verify(args):
         ok = False
 
     if up:
-        gw = subprocess.run(["wg", "show", iface(), "endpoints"],
-                            capture_output=True, text=True).stdout.strip()
+        gw = wg_show("endpoints").strip()
         print(f"peer      : {gw or '-'}")
     print("RESULT    : " + ("tunneled (all host traffic exits the node, or is dropped)"
                             if ok else "NOT fully verified"))
@@ -1175,8 +1185,7 @@ def cmd_verify(args):
 
 
 def _iface_up() -> bool:
-    p = subprocess.run(["wg", "show", iface()], capture_output=True, text=True)
-    return p.returncode == 0 and bool(p.stdout.strip())
+    return iface_exists()
 
 
 def cmd_watch(args):

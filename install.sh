@@ -143,7 +143,7 @@ fi
 
 # --- 5. sudoers -----------------------------------------------------------
 cat > /etc/sudoers.d/dvpnctl <<EOF
-$TARGET_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start $UNIT, /usr/bin/systemctl stop $UNIT, /usr/bin/systemctl restart $UNIT, /usr/bin/systemctl reset-failed $UNIT
+$TARGET_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start $UNIT, /usr/bin/systemctl stop $UNIT, /usr/bin/systemctl restart $UNIT, /usr/bin/systemctl reset-failed $UNIT, /usr/bin/wg show *
 EOF
 chmod 440 /etc/sudoers.d/dvpnctl
 visudo -cf /etc/sudoers.d/dvpnctl >/dev/null
