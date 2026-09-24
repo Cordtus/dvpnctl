@@ -62,7 +62,6 @@ RPC_FALLBACKS = [
 DEFAULTS = {
     # --- chain / keyring ---
     "rpc": "https://sentinel-rpc.polkachu.com:443",  # writes use this endpoint
-    "chain_id": "sentinelhub-2",
     "keyring_backend": "os",   # user-side keyring backend
     "key_name": "main",
     "cli_home": CLI_HOME,      # engine data dir (~/.sentinel-dvpncli)
@@ -277,12 +276,14 @@ def tx_with_retry(args: list[str], verify) -> str:
         if p.returncode == 0:
             return p.stdout
         last = p
-        sys.stderr.write((p.stdout or "") + clean_stderr(p.stderr or ""))
+        # Sequence-mismatch and tx-not-found are normal while RPC nodes catch up;
+        # a later endpoint usually succeeds. Only surface the error if all fail.
         time.sleep(3)
         if verify():
             print("transaction landed despite the RPC error; continuing")
             return ""
-    sys.stderr.write((last.stdout or "") + clean_stderr(last.stderr or "") if last else "")
+    if last is not None:
+        sys.stderr.write((last.stdout or "") + clean_stderr(last.stderr or ""))
     sys.exit("transaction failed on all RPC endpoints")
 
 
@@ -475,8 +476,7 @@ def fetch_nodes(limit: int = 400, refresh: bool = False) -> list[dict]:
     if not refresh and os.path.exists(NODES_CACHE):
         age = time.time() - os.path.getmtime(NODES_CACHE)
         if age < NODES_CACHE_TTL:
-            with open(NODES_CACHE) as f:
-                return normalize_nodes(f.read())
+            return normalize_nodes(open(NODES_CACHE).read())
     out = cli(["query", "nodes", "--status", "active",
                "--page.limit", str(limit), "--page.count-total"], rpc=True)
     os.makedirs(CFG_DIR, exist_ok=True)
@@ -595,32 +595,47 @@ def cmd_best(args):
 
 # ---------------------------------------------------------------- sessions
 
-def find_active_session(addr: str, node: str, timeout: float = 20.0) -> int | None:
-    """Newest active session for a node. Queries every RPC and takes the max so a
-    lagging node cannot hide a session that another node already has."""
+def find_active_session(addr: str, node: str, timeout: float = 20.0,
+                        exclude: set[int] | None = None) -> int | None:
+    """Newest active session for a node that at least two RPCs agree on.
+
+    Querying every endpoint and taking the max from whichever answers first
+    trusts a lagging endpoint's stale view: a deleted session keeps reappearing
+    as active, is reused, and `connect` is rejected by the node with
+    "already exists in database". Require corroboration so one stale endpoint
+    cannot resurrect a dead session. If only one endpoint is reachable at all,
+    fall back to its view (better than refusing to connect). `exclude` drops ids
+    the node has already rejected.
+    """
     import yaml
+    exclude = exclude or set()
     cfg = load_cfg()
     endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
     deadline = time.time() + timeout
     while True:
-        best = None
+        votes: dict[int, int] = {}  # session id -> number of endpoints agreeing
+        responders = 0
         for url in endpoints:
             p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
                      "query", "sessions", "--account-addr", addr, "--page.limit", "100",
                      "--rpc.addrs", url, "--rpc.timeout", "15s"], check=False)
             if p.returncode != 0:
                 continue
+            responders += 1
             data = yaml.safe_load(p.stdout) or {}
+            seen = set()
             for d in walk(data):
                 sid = d.get("id")
                 if (d.get("node_address") == node and session_active(d.get("status"))
                         and isinstance(sid, (int, float))):
-                    # the YAML emitter may render uint64 ids as 6.1139744e+07
-                    sid = int(sid)
-                    if best is None or sid > best:
-                        best = sid
-        if best is not None:
-            return best
+                    seen.add(int(sid))  # the YAML emitter may render uint64 ids as floats
+            for sid in seen:
+                votes[sid] = votes.get(sid, 0) + 1
+        # a session is usable when a majority of the responding endpoints list it
+        need = 2 if responders >= 2 else 1
+        agreed = [sid for sid, n in votes.items() if n >= need and sid not in exclude]
+        if agreed:
+            return max(agreed)
         if time.time() >= deadline:
             return None
         time.sleep(3)
@@ -630,13 +645,28 @@ def tx_session_id(text: str) -> int | None:
     """Pull the session id from a tx's own events (authoritative, no stale read).
 
     The events live inside `tx_result.log`, which is itself a JSON-encoded
-    string, so walk both the outer object and any JSON strings found within.
+    string, so walk the outer object and any embedded JSON strings found within.
     """
     data = extract_json(text)
     if not data:
         return None
+
+    def json_strings(obj):
+        yield obj
+        if isinstance(obj, dict):
+            for v in obj.values():
+                yield from json_strings(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from json_strings(v)
+        elif isinstance(obj, str) and obj.strip()[:1] in "[{":
+            try:
+                yield json.loads(obj)
+            except json.JSONDecodeError:
+                pass
+
     ids = []
-    for blob in _json_strings(data):
+    for blob in json_strings(data):
         for d in walk(blob):
             if d.get("key") == "session_id":
                 v = str(d.get("value", "")).strip('"')
@@ -645,34 +675,18 @@ def tx_session_id(text: str) -> int | None:
     return max(ids) if ids else None
 
 
-def _json_strings(obj):
-    """Yield obj plus any embedded JSON string values (one level of nesting)."""
-    yield obj
-    if isinstance(obj, dict):
-        for v in obj.values():
-            yield from _json_strings(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _json_strings(v)
-    elif isinstance(obj, str):
-        s = obj.strip()
-        if s[:1] in "[{":
-            try:
-                yield json.loads(s)
-            except json.JSONDecodeError:
-                pass
-
-
-def start_session(cfg: dict, node: dict, reconcile: bool = True) -> int:
+def start_session(cfg: dict, node: dict, reconcile: bool = True,
+                  exclude: set[int] | None = None) -> int:
+    exclude = exclude or set()
     addr = my_address()
     if reconcile:
         # tidy stale/duplicate sessions and reuse a good one if it exists
         kept = reconcile_sessions({node["address"]: -1})
-        if node["address"] in kept:
-            sid = kept[node["address"]]
+        sid = kept.get(node["address"])
+        if sid is not None and sid not in exclude:
             print(f"reusing active session {sid} on {node['moniker']}")
             return sid
-    existing = find_active_session(addr, node["address"], timeout=0)
+    existing = find_active_session(addr, node["address"], timeout=0, exclude=exclude)
     if existing is not None:
         print(f"reusing active session {existing} on {node['moniker']}")
         return existing
@@ -733,13 +747,13 @@ def cancel_session(sid: int, wait: bool = False) -> None:
     # A cancelled session lingers as inactive_pending for a block or two, and
     # cancelling it again is rejected with an "invalid status" error. Skip the
     # tx when it is already inactive (or gone).
-    if not session_active(session_status(sid)):
-        return
-    tx_with_retry(["session-cancel", str(sid)],
-                  lambda: not session_active(session_status(sid)))
+    if session_active(session_status(sid)):
+        tx_with_retry(["session-cancel", str(sid)],
+                      lambda: not session_active(session_status(sid)))
     if wait:
         # cancel only marks inactive_pending; the chain deletes it a block or
-        # two later. Wait until it is gone so a new session gets a new id.
+        # two later. Wait until it is gone so a new session gets a new id, even
+        # if a prior cancel already flipped it to inactive_pending.
         deadline = time.time() + 60
         while time.time() < deadline:
             if session_status(sid) is None:
@@ -756,11 +770,8 @@ def session_on(url: str, sid: int) -> bool:
     if p.returncode != 0:
         return False
     data = yaml.safe_load(p.stdout) or {}
-    for d in walk(data):
-        v = d.get("id")
-        if isinstance(v, (int, float)) and int(v) == sid and session_active(d.get("status")):
-            return True
-    return False
+    return any(isinstance(d.get("id"), (int, float)) and int(d["id"]) == sid
+               and session_active(d.get("status")) for d in walk(data))
 
 
 def working_rpc(sid: int) -> str:
@@ -805,11 +816,20 @@ def read_session_file() -> int | None:
 
 def all_sessions() -> list[dict]:
     """Every session on the account, keyed by id, with the freshest view across
-    all RPCs (they disagree while the chain catches up)."""
+    all RPCs (they disagree while the chain catches up).
+
+    A record counts as *active* only when a majority of the responding endpoints
+    report it active. Otherwise a lagging endpoint's stale view resurrects a
+    deleted session and it gets reused (then rejected by the node with "already
+    exists in database"). Inactive/gone records are still returned so they can
+    be cleaned up.
+    """
     import yaml
     cfg = load_cfg()
     endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
     by_id: dict[int, dict] = {}
+    active_votes: dict[int, int] = {}
+    responders = 0
     for url in endpoints:
         p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
                  "query", "sessions", "--account-addr", my_address(),
@@ -817,16 +837,24 @@ def all_sessions() -> list[dict]:
                 check=False)
         if p.returncode != 0:
             continue
+        responders += 1
         for d in walk(yaml.safe_load(p.stdout) or {}):
             sid = d.get("id")
             if not isinstance(sid, (int, float)):
                 continue
             sid = int(sid)
+            if session_active(d.get("status")):
+                active_votes[sid] = active_votes.get(sid, 0) + 1
             # a later endpoint reporting a different status may be stale; keep
             # the highest status value (active=1 < pending=2 < inactive=3)
             prev = by_id.get(sid)
             if prev is None or status_rank(d.get("status")) > status_rank(prev.get("status")):
                 by_id[sid] = {**d, "id": sid}
+    need = 2 if responders >= 2 else 1
+    for sid, s in list(by_id.items()):
+        if session_active(s.get("status")) and active_votes.get(sid, 0) < need:
+            # only one endpoint claimed this; do not treat it as reusable
+            by_id[sid] = {**s, "status": "unconfirmed"}
     return list(by_id.values())
 
 
@@ -887,15 +915,10 @@ def reconcile_sessions(wanted: dict[str, int]) -> dict[str, int]:
 
 # ---------------------------------------------------------------- systemd
 
-def systemctl(action: str, quiet: bool = False, interactive: bool = True) -> int:
+def systemctl(action: str, quiet: bool = False) -> int:
     # sudoers grants passwordless control once install.sh ran.
-    unit = unit_name()
-    p = subprocess.run(["sudo", "-n", "systemctl", action, unit],
+    p = subprocess.run(["sudo", "-n", "systemctl", action, unit_name()],
                        capture_output=True, text=True)
-    if p.returncode != 0 and interactive:
-        # not installed yet, or no sudoers rule: fall back to an interactive prompt
-        p = subprocess.run(["sudo", "systemctl", action, unit],
-                           capture_output=True, text=True)
     if p.returncode != 0 and not quiet:
         sys.stderr.write(p.stdout + p.stderr)
     return p.returncode
@@ -936,6 +959,29 @@ def wait_for_iface(timeout: float = 40.0) -> bool:
     return False
 
 
+def unit_logs(lines: int = 20) -> str:
+    p = subprocess.run(["journalctl", "-u", unit_name(), "-n", str(lines),
+                        "--no-pager"], capture_output=True, text=True)
+    return p.stdout or ""
+
+
+def last_unit_error(sid: int) -> str:
+    """Most recent error line from the unit's journal, if it names `sid`."""
+    for line in reversed(unit_logs(15).splitlines()):
+        if f"session {sid}" in line:
+            return line.strip()
+    return ""
+
+
+def connect_failed_already_exists(sid: int) -> bool:
+    """True when the unit failed because the node already registered `sid`.
+
+    A session's peer can only be handshaken once; a reused session whose probe
+    (or a prior run's failed connect) already hit the node is dead for connect.
+    """
+    return "already exists in database" in last_unit_error(sid)
+
+
 # ---------------------------------------------------------------- commands
 
 def session_mode_label(cfg: dict) -> str:
@@ -952,18 +998,37 @@ def bring_up(node: dict, cfg: dict) -> bool:
         sys.stderr.write(f"tunnel unit {unit_name()} is not installed - run ./install.sh\n")
         return False
     sid = start_session(cfg, node)
-    write_session_file(sid)
-    # A previous failed connect can leave the unit in systemd's start-limit-hit
-    # state, which refuses further starts for two minutes; clear it first.
-    systemctl("reset-failed", quiet=True, interactive=False)
-    if systemctl("restart") != 0:
-        sys.stderr.write("could not start the tunnel unit\n")
-        return False
-    if not wait_for_iface():
-        sys.stderr.write("tunnel did not come up; recent logs:\n")
-        subprocess.run(["journalctl", "-u", unit_name(), "-n", "30", "--no-pager"])
-        return False
-    return True
+    poisoned: set[int] = set()
+    for attempt in (1, 2):
+        write_session_file(sid)
+        # A previous failed connect can leave the unit in systemd's start-limit-hit
+        # state, which refuses further starts for two minutes; clear it first.
+        systemctl("reset-failed", quiet=True)
+        if systemctl("restart") != 0:
+            sys.stderr.write("could not start the tunnel unit\n")
+            return False
+        if wait_for_iface(timeout=15):
+            return True
+        if attempt == 1 and connect_failed_already_exists(sid):
+            # Stale session whose peer the node already registered (a probe or an
+            # earlier failed connect). It can never handshake again, so cancel it,
+            # wait for deletion, and escrow a fresh one. Poison the id so a lagging
+            # endpoint cannot hand the same dead session back.
+            print(f"  session {sid} already registered on {node['moniker']}; "
+                  f"starting a fresh one")
+            poisoned.add(sid)
+            systemctl("stop", quiet=True)
+            try:
+                cancel_session(sid, wait=True)
+            except SystemExit:
+                sys.stderr.write(f"could not clear stale session {sid}\n")
+                return False
+            sid = start_session(cfg, node, reconcile=False, exclude=poisoned)
+            continue
+        break
+    sys.stderr.write("tunnel did not come up; recent logs:\n")
+    sys.stderr.write(unit_logs(30))
+    return False
 
 
 def tear_down_iface(cancel: bool = True) -> None:
@@ -992,7 +1057,7 @@ def probe_candidates(cfg: dict, nodes: list[dict]) -> list[dict]:
     return candidates[:max(1, cfg["speed_probe_count"])]
 
 
-def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tuple[dict, float | None]:
+def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
     """Test the top candidates and keep the fastest measured one.
 
     Each candidate is connected for real (a refundable session is escrowed then
@@ -1006,11 +1071,11 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
 
     top = probe_candidates(cfg, nodes)
     ranked: list[tuple[dict, float]] = []
+    probed: dict[str, int] = {}  # node address -> session id its probe used
     for node in top:
         cached = cached_speed(node["address"], cfg["speed_cache_ttl"])
         if cached is not None:
-            if verbose:
-                print(f"probe {node['moniker']}: cached {cached / 1e6:.1f} MB/s")
+            print(f"probe {node['moniker']}: cached {cached / 1e6:.1f} MB/s")
             ranked.append((node, cached))
             continue
 
@@ -1019,6 +1084,7 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
             print("  could not connect; skipping")
             tear_down_iface(cancel=True)
             continue
+        sid = read_session_file()
         bps = measure_speed(cfg)
         if bps is None:
             print("  speed test failed; skipping")
@@ -1027,6 +1093,8 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
         record_speed(node["address"], bps)
         print(f"  measured {bps / 1e6:.1f} MB/s ({bps * 8 / 1e6:.0f} Mbps)")
         ranked.append((node, bps))
+        if sid is not None:
+            probed[node["address"]] = sid
         tear_down_iface(cancel=True)
 
     if not ranked:
@@ -1037,8 +1105,17 @@ def probe_and_select(cfg: dict, nodes: list[dict], verbose: bool = True) -> tupl
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     winner, bps = ranked[0]
-    if verbose:
-        print(f"fastest: {winner['moniker']} at {bps / 1e6:.1f} MB/s")
+    # The winning node already registered its probe session's peer, so handing
+    # that session to `connect` again is rejected with "already exists in
+    # database". Drop it fully; bring_up then escrows a fresh session (the
+    # deposit is refunded).
+    psid = probed.get(winner["address"])
+    if psid is not None:
+        try:
+            cancel_session(psid, wait=True)
+        except SystemExit:
+            print(f"  warning: could not clear probe session {psid}")
+    print(f"fastest: {winner['moniker']} at {bps / 1e6:.1f} MB/s")
     return winner, bps
 
 
@@ -1046,7 +1123,7 @@ def cmd_up(args):
     cfg = load_cfg()
     if not wallet_exists():
         sys.exit("no wallet yet - run: dvpnctl init")
-    nodes = fetch_nodes(refresh=False)
+    nodes = fetch_nodes()
 
     if args.gigabytes is not None:
         cfg["session_gigabytes"] = args.gigabytes
@@ -1176,7 +1253,7 @@ def cmd_fund(args):
         sys.exit("no wallet yet - run: dvpnctl init")
     print(f"Send DVPN (Sentinel, sentinelhub-2) to:\n  {addr}")
     try:
-        nodes = fetch_nodes(refresh=False)
+        nodes = fetch_nodes()
         prices = sorted(gb_price(n) for n in nodes if n.get("gb"))
         lo = prices[0] if prices else 12.5
     except SystemExit:
@@ -1188,12 +1265,11 @@ def cmd_fund(args):
 def cmd_verify(args):
     """Prove that traffic is actually tunneled: routing, firewall, and exit IP."""
     cfg = load_cfg()
-    up = unit_active() and _iface_up()
+    up = unit_active() and iface_exists()
     ok = True
 
-    print(f"interface : {iface()} {'up' if _iface_up() else 'DOWN'}")
-    if not _iface_up():
-        ok = False
+    print(f"interface : {iface()} {'up' if iface_exists() else 'DOWN'}")
+    ok &= iface_exists()
 
     # ip rules: wg-quick default-route mode adds a `not fwmark` rule + suppress
     rules = subprocess.run(["ip", "rule"], capture_output=True, text=True).stdout
@@ -1208,10 +1284,8 @@ def cmd_verify(args):
         text = out.stdout if out.returncode == 0 else ""
         drop = any(iface() in l and "DROP" in l for l in text.splitlines())
         print(f"{tool:<9} : {'kill-switch DROP present' if drop else 'not readable/MISSING'}")
-        if not text:
-            # can't inspect without sudo; don't fail the check, just note it
-            continue
-        ok &= drop
+        if text:
+            ok &= drop  # can't inspect without sudo; don't fail, just note it
 
     # exit IP: with the tunnel up it must differ from the direct path
     direct = external_ip(cfg["watch_timeout"])
@@ -1227,10 +1301,6 @@ def cmd_verify(args):
     sys.exit(0 if ok else 1)
 
 
-def _iface_up() -> bool:
-    return iface_exists()
-
-
 def cmd_watch(args):
     """Health probe; fail over to another node after repeated failures.
 
@@ -1238,7 +1308,7 @@ def cmd_watch(args):
     tunnel is up), non-zero only on an unexpected internal error.
     """
     cfg = load_cfg()
-    if not _iface_up():
+    if not iface_exists():
         print("watch: tunnel down, nothing to do")
         return
     fails_file = os.path.join(CFG_DIR, "watch.fails")

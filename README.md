@@ -133,7 +133,6 @@ the directory with `DVPNCTL_CONFIG_DIR`). Defaults:
 ```json
 {
   "rpc": "https://sentinel-rpc.polkachu.com:443",
-  "chain_id": "sentinelhub-2",
   "keyring_backend": "os",
   "key_name": "main",
   "cli_home": "/home/<you>/.sentinel-dvpncli",
