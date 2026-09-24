@@ -1057,14 +1057,18 @@ def session_mode_label(cfg: dict) -> str:
     return f"{cfg['session_hours']}h"
 
 
-def bring_up(node: dict, cfg: dict) -> bool:
+def bring_up(node: dict, cfg: dict, reconcile: bool = True) -> bool:
     """Start (or reuse) a session for `node`, point the unit at it, bring the
-    tunnel up, and wait for the interface. Returns False on any failure."""
+    tunnel up, and wait for the interface. Returns False on any failure.
+
+    `reconcile=False` skips the account-wide session cleanup, for callers that
+    already reconciled (the probe loop does it once, not once per candidate).
+    """
     # Check the unit first: without it we would escrow a session only to fail.
     if not unit_installed():
         sys.stderr.write(f"tunnel unit {unit_name()} is not installed - run ./install.sh\n")
         return False
-    sid = start_session(cfg, node)
+    sid = start_session(cfg, node, reconcile=reconcile)
     poisoned: set[int] = set()
     for attempt in (1, 2, 3):
         write_session_file(sid)
@@ -1138,6 +1142,9 @@ def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
         return node, None
 
     top = probe_candidates(cfg, nodes)
+    # Reconcile once for the whole run: sweeping stale sessions on every
+    # candidate is the same cleanup repeated N times (N × endpoints queries).
+    reconcile_sessions({})
     ranked: list[tuple[dict, float]] = []
     probed: dict[str, int] = {}  # node address -> session id its probe used
     for node in top:
@@ -1148,7 +1155,7 @@ def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
             continue
 
         print(f"probe {node['moniker']} [{node['country']}] ...")
-        if not bring_up(node, cfg):
+        if not bring_up(node, cfg, reconcile=False):
             print("  could not connect; skipping")
             tear_down_iface(cancel=True)
             continue

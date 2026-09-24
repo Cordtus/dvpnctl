@@ -168,10 +168,11 @@ def test_connect_error_detection(m):
     fast = {"address": "fast", "moniker": "F", "country": "DE"}
     m.probe_candidates = lambda cfg, nodes: [slow, fast]
     m.cached_speed = lambda addr, ttl: None
+    m.reconcile_sessions = lambda wanted: {}
     sid_by_addr = {"slow": 11, "fast": 22}
     cur = {}
 
-    def fake_bring(n, cfg):
+    def fake_bring(n, cfg, reconcile=True):
         cur["addr"] = n["address"]
         return True
 
@@ -203,9 +204,39 @@ def test_probe_uses_cached_speed(m):
     node = {"address": "a", "moniker": "M", "country": "GB"}
     m.probe_candidates = lambda cfg, nodes: [node]
     m.cached_speed = lambda addr, ttl: 1_000_000.0
-    m.bring_up = lambda n, cfg: (_ for _ in ()).throw(AssertionError("re-probed a cached node"))
+    m.reconcile_sessions = lambda wanted: {}
+    m.bring_up = lambda n, cfg, reconcile=True: (_ for _ in ()).throw(
+        AssertionError("re-probed a cached node"))
     got, bps = m.probe_and_select({"speed_cache_ttl": 1}, [node])
     assert got is node and bps == 1_000_000.0
+
+
+def test_probe_reconciles_once(m):
+    # reconcile must run once for the whole probe, not once per candidate
+    m.unit_installed = lambda: True
+    m.load_cfg = lambda: {"unit_name": "u.service"}
+    nodes = [{"address": "a", "moniker": "A", "country": "DE"},
+             {"address": "b", "moniker": "B", "country": "DE"}]
+    m.probe_candidates = lambda cfg, nodes: nodes
+    m.cached_speed = lambda addr, ttl: None
+    calls = {"reconcile": 0, "bring_up": 0}
+
+    def fake_reconcile(wanted):
+        calls["reconcile"] += 1
+        return {}
+
+    def fake_bring_up(n, cfg, reconcile=True):
+        calls["bring_up"] += 1
+        assert reconcile is False, "per-candidate bring_up must not re-reconcile"
+        return False
+
+    m.reconcile_sessions = fake_reconcile
+    m.bring_up = fake_bring_up
+    m.tear_down_iface = lambda cancel=True: None
+    m.best_node = lambda cfg, nodes, exclude=None: nodes[0]
+    m.probe_and_select({"speed_cache_ttl": 1, "speed_probe_count": 2}, nodes)
+    assert calls["reconcile"] == 1, calls
+    assert calls["bring_up"] == 2, calls
 
 
 def test_session_status_rejects_foreign(m):
