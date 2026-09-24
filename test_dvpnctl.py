@@ -23,20 +23,28 @@ def test_clean_stderr(m):
 
 def test_cancel_skips_when_inactive(m):
     sent = []
+    real_consensus = m.session_status_consensus
     m.tx_with_retry = lambda *a, **k: sent.append(a)
-    m.session_status = lambda sid: "inactive_pending"
-    m.cancel_session(1)
-    assert sent == [], "must not broadcast cancel for an inactive session"
-    m.session_status = lambda sid: None
-    m.cancel_session(1)
-    assert sent == [], "must not broadcast cancel for a gone session"
+    try:
+        m.session_status_consensus = lambda sid: "inactive_pending"
+        m.cancel_session(1)
+        assert sent == [], "must not broadcast cancel for an inactive session"
+        m.session_status_consensus = lambda sid: None
+        m.cancel_session(1)
+        assert sent == [], "must not broadcast cancel for a gone session"
+    finally:
+        m.session_status_consensus = real_consensus
 
 
 def test_cancel_broadcasts_when_active(m):
     sent = []
+    real_consensus = m.session_status_consensus
     m.tx_with_retry = lambda *a, **k: sent.append(a)
-    m.session_status = lambda sid: 1
-    m.cancel_session(1)
+    m.session_status_consensus = lambda sid: 1
+    try:
+        m.cancel_session(1)
+    finally:
+        m.session_status_consensus = real_consensus
     assert len(sent) == 1 and sent[0][0] == ["session-cancel", "1"], sent
 
 
@@ -44,21 +52,67 @@ def test_cancel_wait_polls_until_deleted(m):
     real_sleep = m.time.sleep
     m.time.sleep = lambda s: None
     calls = {"n": 0}
+    state = {"active": True}
 
     def status(sid):
         calls["n"] += 1
-        return "inactive_pending" if calls["n"] <= 2 else None
+        return 1 if state["active"] else None
 
-    m.session_status = status
-    real_tx = m.tx_with_retry
-    m.tx_with_retry = lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("must not re-broadcast cancel for inactive_pending"))
+    def fake_tx(*a, **k):
+        state["active"] = False  # cancel broadcast succeeds; chain clears it
+        return ""
+
+    real_tx, real_consensus = m.tx_with_retry, m.session_status_consensus
+    m.tx_with_retry = fake_tx
+    m.session_status_consensus = status
     try:
         m.cancel_session(1, wait=True)
     finally:
         m.time.sleep = real_sleep
         m.tx_with_retry = real_tx
-    assert calls["n"] >= 3, "wait must poll past inactive_pending to deletion"
+        m.session_status_consensus = real_consensus
+    # one pre-broadcast consensus + at least one wait poll
+    assert calls["n"] >= 2, "wait must poll until the session is deleted"
+
+
+def test_cancel_wait_skips_when_already_inactive(m):
+    # already inactive_pending: no tx, and no 60s wait spin
+    sent = []
+    real_tx, real_consensus = m.tx_with_retry, m.session_status_consensus
+    m.tx_with_retry = lambda *a, **k: sent.append(a)
+    m.session_status_consensus = lambda sid: "inactive_pending"
+    real_sleep = m.time.sleep
+    spins = []
+    m.time.sleep = lambda s: spins.append(s)
+    try:
+        m.cancel_session(1, wait=True)
+    finally:
+        m.time.sleep = real_sleep
+        m.tx_with_retry = real_tx
+        m.session_status_consensus = real_consensus
+    assert sent == [], "no cancel tx for an already-inactive session"
+    assert spins == [], "must not wait on an already-inactive session"
+
+
+def test_session_status_consensus_majority(m):
+    # two endpoints say inactive_pending, one (lagging) says active -> inactive
+    real_fallbacks = m.RPC_FALLBACKS
+    m.RPC_FALLBACKS = ["https://b", "https://c"]
+    m.load_cfg = lambda: {"rpc": "https://a", "cli_home": "/h"}
+    views = {}
+    m.session_status = lambda sid, url=None: views.get(url)
+    try:
+        views.update({"https://a": 1, "https://b": "inactive_pending",
+                      "https://c": "inactive_pending"})
+        assert not m.session_active(m.session_status_consensus(7)), \
+            "majority inactive must win over one lagging active endpoint"
+        views.update({"https://a": 1, "https://b": 1, "https://c": "inactive_pending"})
+        assert m.session_active(m.session_status_consensus(7)), \
+            "majority active must win"
+        m.session_status = lambda sid, url=None: None
+        assert m.session_status_consensus(7) is None, "all gone -> None"
+    finally:
+        m.RPC_FALLBACKS = real_fallbacks
 
 
 def test_bring_up_retries_stale_session(m):
@@ -272,10 +326,18 @@ if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if not name.startswith("test_"):
             continue
-        if "tmp" in fn.__code__.co_varnames[:fn.__code__.co_argcount]:
-            with tempfile.TemporaryDirectory() as d:
-                fn(mod, d)
-        else:
-            fn(mod)
+        # Each check stubs module functions; snapshot the callables and restore
+        # them after the check so one test's stubs cannot leak into the next.
+        saved = {k: v for k, v in vars(mod).items()
+                 if callable(v) and not k.startswith("__")}
+        try:
+            if "tmp" in fn.__code__.co_varnames[:fn.__code__.co_argcount]:
+                with tempfile.TemporaryDirectory() as d:
+                    fn(mod, d)
+            else:
+                fn(mod)
+        finally:
+            for k, v in saved.items():
+                setattr(mod, k, v)
         print(f"ok {name}")
     print("all checks passed")

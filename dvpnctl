@@ -735,10 +735,22 @@ def start_session(cfg: dict, node: dict, reconcile: bool = True,
     return sid
 
 
-def session_status(sid: int):
+def session_status(sid: int, url: str | None = None):
+    """On-chain status for one session id, or None if not found.
+
+    The by-id `query session` is global, not account-scoped, so it is only used
+    through callers that already know the id belongs to this account. `url`
+    pins the endpoint; otherwise the configured RPC is used.
+    """
     import yaml
-    raw = cli(["query", "session", str(sid)], rpc=True)
-    data = yaml.safe_load(raw) or {}
+    cfg = load_cfg()
+    target = url or cfg["rpc"]
+    p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
+             "query", "session", str(sid),
+             "--rpc.addrs", target, "--rpc.timeout", "15s"], check=False)
+    if p.returncode != 0:
+        return None
+    data = yaml.safe_load(p.stdout) or {}
     for d in walk(data):
         v = d.get("id")
         if isinstance(v, (int, float)) and int(v) == sid and "status" in d:
@@ -750,20 +762,48 @@ def session_active(v) -> bool:
     return v in (1, "1", "active", "STATUS_ACTIVE")
 
 
+def session_status_consensus(sid: int):
+    """Status agreed by a majority of endpoints, or None if all report gone.
+
+    Endpoints disagree wildly (one may still call a cancelled session active
+    while the rest call it inactive_pending). Trusting a single endpoint makes
+    `cancel_session` broadcast a doomed tx and makes `find_active_session`
+    reuse a dead session. Rank every reachable view and return the majority;
+    ties fall back to the most-inactive reading, which is the safe direction
+    (a no-op cancel beats a rejected tx).
+    """
+    cfg = load_cfg()
+    endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
+    counts: dict[str, int] = {}
+    for url in endpoints:
+        st = session_status(sid, url)
+        if st is None:
+            continue
+        key = "active" if session_active(st) else "inactive"
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    if counts.get("active", 0) > counts.get("inactive", 0):
+        return 1
+    return "inactive_pending"
+
+
 def cancel_session(sid: int, wait: bool = False) -> None:
     # A cancelled session lingers as inactive_pending for a block or two, and
-    # cancelling it again is rejected with an "invalid status" error. Skip the
-    # tx when it is already inactive (or gone).
-    if session_active(session_status(sid)):
+    # cancelling it again is rejected with an "invalid status" error. Use the
+    # majority view, not one lagging endpoint, to decide whether to broadcast.
+    status = session_status_consensus(sid)
+    if session_active(status):
         tx_with_retry(["session-cancel", str(sid)],
-                      lambda: not session_active(session_status(sid)))
-    if wait:
-        # cancel only marks inactive_pending; the chain deletes it a block or
-        # two later. Wait until it is gone so a new session gets a new id, even
-        # if a prior cancel already flipped it to inactive_pending.
+                      lambda: not session_active(session_status_consensus(sid)))
+    if wait and session_active(status):
+        # Only wait when we actually cancelled an active session; a session that
+        # was already inactive_pending is on its way out and waiting on it just
+        # burns the timeout. The deletion matters because the node will not
+        # re-handshake a cancelled session id.
         deadline = time.time() + 60
         while time.time() < deadline:
-            if session_status(sid) is None:
+            if session_status_consensus(sid) is None:
                 return
             time.sleep(3)
         sys.exit(f"session {sid} did not clear after cancel; try again shortly")
@@ -1006,7 +1046,7 @@ def bring_up(node: dict, cfg: dict) -> bool:
         return False
     sid = start_session(cfg, node)
     poisoned: set[int] = set()
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         write_session_file(sid)
         # A previous failed connect can leave the unit in systemd's start-limit-hit
         # state, which refuses further starts for two minutes; clear it first.
@@ -1016,11 +1056,13 @@ def bring_up(node: dict, cfg: dict) -> bool:
             return False
         if wait_for_iface(timeout=15):
             return True
-        if attempt == 1 and connect_failed_already_exists(sid):
+        if connect_failed_already_exists(sid):
             # Stale session whose peer the node already registered (a probe or an
-            # earlier failed connect). It can never handshake again, so cancel it,
-            # wait for deletion, and escrow a fresh one. Poison the id so a lagging
-            # endpoint cannot hand the same dead session back.
+            # earlier failed connect). It can never handshake again, so poison it
+            # and escrow a fresh one. Clearing the old session is best-effort: if
+            # it is foreign or already inactive the cancel is rejected, but that
+            # must not abort — only the old id is unusable, not the node. A fresh
+            # session gets a new id and handshakes cleanly.
             print(f"  session {sid} already registered on {node['moniker']}; "
                   f"starting a fresh one")
             poisoned.add(sid)
@@ -1028,8 +1070,7 @@ def bring_up(node: dict, cfg: dict) -> bool:
             try:
                 cancel_session(sid, wait=True)
             except SystemExit:
-                sys.stderr.write(f"could not clear stale session {sid}\n")
-                return False
+                print(f"  could not clear stale session {sid}; leaving it to expire")
             sid = start_session(cfg, node, reconcile=False, exclude=poisoned)
             continue
         break
