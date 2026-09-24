@@ -263,10 +263,15 @@ def tx_with_retry(args: list[str], verify) -> str:
 
     verify() must return truthy if the tx already took effect. It is checked
     after a failed broadcast so a response timeout cannot cause a double-submit.
+    The usual failure on a public endpoint is that it has tx indexing disabled
+    (`query tx` returns "not found" / RPC -32603) even though the tx broadcast
+    and committed; verify() reads account/session state, which any full node
+    serves, so it confirms the tx without needing an indexer.
     """
     cfg = load_cfg()
     endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
     last = None
+    last_url = cfg["rpc"]
     for url in endpoints:
         p = run([cli_path(), "--home", cli_home(), "--log.level", "error", "tx", *args,
                  "--keyring.backend", cfg["keyring_backend"],
@@ -276,11 +281,13 @@ def tx_with_retry(args: list[str], verify) -> str:
         if p.returncode == 0:
             return p.stdout
         last = p
-        # Sequence-mismatch and tx-not-found are normal while RPC nodes catch up;
-        # a later endpoint usually succeeds. Only surface the error if all fail.
+        last_url = url
+        # A failed broadcast here is usually the endpoint lacking a tx index or
+        # lagging in sequence, not a rejected tx. Only surface it if all fail.
         time.sleep(3)
         if verify():
-            print("transaction landed despite the RPC error; continuing")
+            print(f"tx broadcast OK but {last_url} could not confirm it "
+                  f"(likely tx indexing disabled); verified on-chain, continuing")
             return ""
     if last is not None:
         sys.stderr.write((last.stdout or "") + clean_stderr(last.stderr or ""))

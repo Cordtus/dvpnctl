@@ -62,13 +62,19 @@ download_engine() {
 
 # The upstream musl-linked release needs a loader some hosts lack; fall back to
 # a static build from source. Requires Go and network access to the module proxy.
+#
+# Build with Go <= 1.26: the SDK's bytedance/sonic dependency only supports
+# go1.17~1.26 on amd64 (1.20~1.26 on arm64) and otherwise prints an unconditional
+# stderr warning at startup ("sonic/ast only supports ... fallback to
+# encoding/json"). GOTOOLCHAIN lets a newer Go fetch a compatible toolchain.
 build_engine() {
   command -v go >/dev/null || return 1
   local tmp
   tmp="$(mktemp -d)"
-  echo "building sentinel-dvpncli from source (static) ..."
+  echo "building sentinel-dvpncli from source (static, GOTOOLCHAIN=go1.26.0) ..."
   if git clone --depth 1 https://github.com/sentinel-official/cli-client "$tmp/src" \
-     && ( cd "$tmp/src" && CGO_ENABLED=0 go build -ldflags="-s -w" -o "$tmp/engine" . ) \
+     && ( cd "$tmp/src" && CGO_ENABLED=0 GOTOOLCHAIN=go1.26.0 \
+          go build -ldflags="-s -w" -o "$tmp/engine" . ) \
      && install -m755 "$tmp/engine" "$BINDIR/sentinel-dvpncli"; then
     ENGINE="$BINDIR/sentinel-dvpncli"
     rm -rf "$tmp"

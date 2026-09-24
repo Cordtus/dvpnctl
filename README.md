@@ -23,7 +23,8 @@ third-party component is the official Sentinel CLI.
 - **Python 3** with **PyYAML**.
 - `iptables`/`ip6tables` (kill switch) and `openresolv` (`resolvconf`).
 - **sentinel-dvpncli v5** — the installer obtains it (preinstalled → release →
-  source build). Building from source needs **Go ≥ 1.25** and `git`.
+  source build). Building from source needs any **Go** and `git`; the build pins
+  `GOTOOLCHAIN=go1.26.0` because the SDK's JSON dependency warns on newer Go.
 
 ## Install
 
