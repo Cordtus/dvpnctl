@@ -208,6 +208,40 @@ def test_probe_uses_cached_speed(m):
     assert got is node and bps == 1_000_000.0
 
 
+def test_session_status_rejects_foreign(m):
+    # by-id query is global; a foreign acc_address must yield None
+    saved = {k: getattr(m, k) for k in ("run", "load_cfg", "cli_path", "cli_home",
+                                        "my_address", "_ADDRESS_CACHE")}
+    m.load_cfg = lambda: {"rpc": "https://a", "cli_home": "/h"}
+    m.cli_path = lambda: "/bin/cli"
+    m.cli_home = lambda: "/h"
+    m.my_address = lambda: "sent1mine"
+
+    class P:
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    yaml_out = (
+        "base_session:\n"
+        "    acc_address: sent1someoneelse\n"
+        "    id: 6.3348021e+07\n"
+        "    status: 1\n")
+    m.run = lambda cmd, **kw: P(yaml_out)
+    try:
+        assert m.session_status(63348021) is None, \
+            "must not report status for another account's session"
+        assert not m.session_on("https://a", 63348021)
+        # own session still works
+        m.run = lambda cmd, **kw: P(yaml_out.replace("sent1someoneelse", "sent1mine"))
+        assert m.session_active(m.session_status(63348021))
+        assert m.session_on("https://a", 63348021)
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+
+
 def test_recover_backup_writes_on_match(m, tmp):
     import json, os
     m.CFG_DIR = tmp
@@ -237,8 +271,11 @@ def test_session_file_exclude_flags(m, tmp):
 
 
 def test_session_report(m):
+    real_addr = m.my_address
+    m.my_address = lambda: "sent1abc"
     m.cli = lambda *a, **k: (
         "base_session:\n"
+        "  acc_address: sent1abc\n"
         "  download_bytes: \"341079180\"\n"
         "  upload_bytes: \"591056848\"\n"
         "  id: 6.2861151e+07\n"
@@ -246,10 +283,24 @@ def test_session_report(m):
         "price:\n"
         "  quote_value: \"12500000\"\n")
     m.human_bytes = lambda n: f"{n}B"
-    report = m.session_report(62861151)
+    try:
+        report = m.session_report(62861151)
+    finally:
+        m.my_address = real_addr
     assert report.startswith("session 62861151: "), report
     assert "cost ~11.6517 DVPN" in report, report
     assert "refund ~50.8483 of 62.5000 DVPN escrowed" in report, report
+
+    # a session belonging to another account is not reported
+    m.my_address = lambda: "sent1mine"
+    m.cli = lambda *a, **k: (
+        "base_session:\n"
+        "  acc_address: sent1someoneelse\n"
+        "  download_bytes: \"1\"\n")
+    try:
+        assert m.session_report(1) is None, "must not report a foreign session"
+    finally:
+        m.my_address = real_addr
 
 
 def test_recover_backup_rejects_mismatch(m, tmp):

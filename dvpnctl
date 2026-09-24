@@ -336,7 +336,12 @@ def have_yaml():
 
 # ---------------------------------------------------------------- wallet
 
+_ADDRESS_CACHE: list = []  # one-element cache; the keyring does not change mid-run
+
+
 def my_address() -> str | None:
+    if _ADDRESS_CACHE:
+        return _ADDRESS_CACHE[0]
     out = cli_keys(["list", "--output-format", "json"])
     data = extract_json(out)
     if not data:
@@ -345,7 +350,9 @@ def my_address() -> str | None:
     name = load_cfg()["key_name"]
     for k in items:
         if isinstance(k, dict) and k.get("name") == name:
-            return k.get("address")
+            addr = k.get("address")
+            _ADDRESS_CACHE.append(addr)
+            return addr
     return None
 
 
@@ -735,12 +742,22 @@ def start_session(cfg: dict, node: dict, reconcile: bool = True,
     return sid
 
 
-def session_status(sid: int, url: str | None = None):
-    """On-chain status for one session id, or None if not found.
+def session_owned(d: dict) -> bool:
+    """True when a session record belongs to this account.
 
-    The by-id `query session` is global, not account-scoped, so it is only used
-    through callers that already know the id belongs to this account. `url`
-    pins the endpoint; otherwise the configured RPC is used.
+    A by-id `query session` is global: it happily returns another account's
+    session. Acting on one (reusing it, or cancelling it) fails at best and
+    broadcasts a worthless tx at worst, so every by-id record is checked against
+    our own address before use. A missing acc_address is treated as not ours.
+    """
+    addr = my_address()
+    return bool(addr) and d.get("acc_address") == addr
+
+
+def session_status(sid: int, url: str | None = None):
+    """On-chain status for one session id owned by this account, else None.
+
+    `url` pins the endpoint; otherwise the configured RPC is used.
     """
     import yaml
     cfg = load_cfg()
@@ -754,6 +771,8 @@ def session_status(sid: int, url: str | None = None):
     for d in walk(data):
         v = d.get("id")
         if isinstance(v, (int, float)) and int(v) == sid and "status" in d:
+            if not session_owned(d):
+                return None  # another account's session; not ours to touch
             return d.get("status")
     return None
 
@@ -818,7 +837,8 @@ def session_on(url: str, sid: int) -> bool:
         return False
     data = yaml.safe_load(p.stdout) or {}
     return any(isinstance(d.get("id"), (int, float)) and int(d["id"]) == sid
-               and session_active(d.get("status")) for d in walk(data))
+               and session_owned(d) and session_active(d.get("status"))
+               for d in walk(data))
 
 
 def working_rpc(sid: int) -> str:
@@ -1218,10 +1238,10 @@ def session_report(sid: int) -> str | None:
     s = data.get("base_session") or {}
     if "download_bytes" not in s:
         s = next((d for d in walk(data) if "download_bytes" in d), {})
+    if "download_bytes" not in s or not session_owned(s):
+        return None
     price = data.get("price") or next(
         (d for d in walk(data) if "quote_value" in d), {})
-    if "download_bytes" not in s:
-        return None
 
     down = int(s.get("download_bytes") or 0)
     up = int(s.get("upload_bytes") or 0)
