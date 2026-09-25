@@ -11,9 +11,18 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_USER="${SUDO_USER:-${1:-}}"
+SEED_ONLY=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --seed-keyring) SEED_ONLY=1 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+TARGET_USER="${SUDO_USER:-${POSITIONAL[0]:-}}"
 if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
   echo "usage: sudo $0 <username>" >&2
+  echo "       sudo $0 --seed-keyring   (internal; called by 'dvpnctl init')" >&2
   exit 1
 fi
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
@@ -21,8 +30,45 @@ CFG_DIR="$TARGET_HOME/.config/dvpnctl"
 ROOT_HOME="/var/lib/dvpnctl"
 UNIT="dvpnctl.service"
 BINDIR="/usr/local/bin"
+KEYRING_MARKER="$CFG_DIR/root-keyring-ok"
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+
+# Seed the root-only keyring from the user's mnemonic backup, then drop a
+# user-readable readiness marker so `dvpnctl doctor`/`up` can tell it is done.
+# Idempotent; safe to call on its own via --seed-keyring.
+seed_root_keyring() {
+  install -d -m700 "$ROOT_HOME"
+  if "$BINDIR/sentinel-dvpncli" --home "$ROOT_HOME" --keyring.backend test \
+        keys list --output-format json 2>/dev/null | grep -q '"name":"main"'; then
+    echo "root service keyring: already present"
+  else
+    if [[ ! -f "$CFG_DIR/wallet-backup.json" ]]; then
+      echo "warning: $CFG_DIR/wallet-backup.json not found" >&2
+      echo "  run 'dvpnctl init' to create the wallet, then re-run:" >&2
+      echo "    sudo $0 $TARGET_USER" >&2
+      return 1
+    fi
+    local mn
+    mn="$(python3 -c \
+      "import json;print(json.load(open('$CFG_DIR/wallet-backup.json'))['mnemonic'])")"
+    if [[ -z "$mn" ]] || ! printf '%s\n\n' "$mn" | "$BINDIR/sentinel-dvpncli" \
+          --home "$ROOT_HOME" --keyring.backend test keys add main >/dev/null; then
+      echo "error: could not seed the root service keyring" >&2
+      return 1
+    fi
+    echo "root service keyring: created"
+  fi
+  : > "$KEYRING_MARKER"
+  chown "$TARGET_USER" "$KEYRING_MARKER"
+  chmod 644 "$KEYRING_MARKER"
+  return 0
+}
+
+if [[ $SEED_ONLY -eq 1 ]]; then
+  seed_root_keyring
+  exit
+fi
 
 for bin in wg wg-quick iptables ip6tables resolvconf systemctl curl; do
   command -v "$bin" >/dev/null || { echo "missing dependency: $bin" >&2; exit 1; }
@@ -115,18 +161,9 @@ chmod 644 /etc/systemd/system/dvpnctl-watch.service /etc/systemd/system/dvpnctl-
 # --- 3. root keyring ------------------------------------------------------
 # `connect` signs the session handshake, so the unit needs the wallet key. The
 # "test" backend stores it under $ROOT_HOME (0700, root-only), no passphrase.
-if ! "$BINDIR/sentinel-dvpncli" --home "$ROOT_HOME" --keyring.backend test \
-      keys list --output-format json 2>/dev/null | grep -q '"name":"main"'; then
-  if [[ -f "$CFG_DIR/wallet-backup.json" ]]; then
-    MN="$(python3 -c \
-      "import json;print(json.load(open('$CFG_DIR/wallet-backup.json'))['mnemonic'])")"
-    printf '%s\n\n' "$MN" | "$BINDIR/sentinel-dvpncli" --home "$ROOT_HOME" \
-      --keyring.backend test keys add main >/dev/null
-    echo "root service keyring: created"
-  else
-    echo "warning: $CFG_DIR/wallet-backup.json not found; run 'dvpnctl init' first" >&2
-  fi
-fi
+# If the wallet does not exist yet, skip it; `dvpnctl init` calls back into
+# `install.sh --seed-keyring` once the wallet (and its backup) exists.
+seed_root_keyring || true
 
 # --- 4. DNS (openresolv must own /etc/resolv.conf for wg-quick) -----------
 # NetworkManager otherwise writes its own header and openresolv's libc
@@ -158,5 +195,11 @@ systemctl daemon-reload
 systemctl reset-failed "$UNIT" 2>/dev/null || true
 
 echo "installed."
-echo "next: as $TARGET_USER run  dvpnctl init  (once),  dvpnctl fund,  dvpnctl up best"
+if [[ -f "$KEYRING_MARKER" ]]; then
+  echo "ready.  Next, as $TARGET_USER:  dvpnctl fund   then   dvpnctl up best"
+else
+  echo "Almost done. As $TARGET_USER run:" >&2
+  echo "    dvpnctl init     # creates the wallet and seeds the service keyring for you" >&2
+fi
+echo "check readiness any time with:  dvpnctl doctor"
 echo "optional auto-failover watchdog:  sudo systemctl enable --now dvpnctl-watch.timer"

@@ -119,8 +119,9 @@ def test_bring_up_retries_stale_session(m):
     saved = {k: getattr(m, k) for k in (
         "unit_installed", "unit_name", "systemctl", "write_session_file",
         "start_session", "wait_for_iface", "connect_failed_already_exists",
-        "unit_logs", "cancel_session")}
+        "unit_logs", "cancel_session", "root_keyring_ready")}
     m.unit_installed = lambda: True
+    m.root_keyring_ready = lambda: True
     m.unit_name = lambda: "u.service"
     m.systemctl = lambda *a, **k: 0
     m.write_session_file = lambda sid: None
@@ -147,6 +148,22 @@ def test_bring_up_retries_stale_session(m):
     assert starts["n"] == 2, "must start a fresh session after the stale-session error"
     assert cleared == [100], "must cancel the stale session"
     assert poison_seen == [{100}], "rejected id must be excluded from re-selection"
+
+
+def test_bring_up_blocks_without_keyring(m):
+    # an unseeded service keyring must fail before a session is escrowed
+    saved = {k: getattr(m, k) for k in (
+        "unit_installed", "root_keyring_ready", "unit_name", "start_session")}
+    m.unit_installed = lambda: True
+    m.root_keyring_ready = lambda: False
+    m.unit_name = lambda: "u.service"
+    m.start_session = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not escrow a session when seeding is missing"))
+    try:
+        assert m.bring_up({"moniker": "M", "address": "a"}, {}) is False
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
 
 
 def test_connect_error_detection(m):

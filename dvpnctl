@@ -43,6 +43,8 @@ EXCLUDED_FILE = os.path.join(CFG_DIR, "excluded.json")  # {node_addr: unix_ts}
 SPEED_FILE = os.path.join(CFG_DIR, "speeds.json")      # {node_addr: {bps, ts}}
 WALLET_BACKUP = os.path.join(CFG_DIR, "wallet-backup.json")
 CLI_HOME = os.path.join(HOME, ".sentinel-dvpncli")
+# Written by install.sh once the root service keyring is seeded; readable by us.
+KEYRING_MARKER = os.path.join(CFG_DIR, "root-keyring-ok")
 
 # Public Sentinel LCD/REST endpoints for balance lookups. Override in config.
 LCD_ENDPOINTS = [
@@ -131,6 +133,28 @@ def cli_home() -> str:
     return load_cfg()["cli_home"]
 
 
+def root_keyring_ready() -> bool:
+    """True once install.sh has seeded the root service keyring."""
+    return os.path.exists(KEYRING_MARKER)
+
+
+def ensure_root_keyring() -> bool:
+    """Seed the root keyring via the installer; returns True on success.
+
+    Called by `init` so setup is one step after the installer, instead of
+    requiring the user to re-run install.sh in the right order.
+    """
+    installer = os.path.join(os.path.dirname(os.path.realpath(__file__)), "install.sh")
+    if not os.path.exists(installer):
+        return False
+    print("seeding the root service keyring (sudo) ...")
+    try:
+        rc = subprocess.run(["sudo", installer, "--seed-keyring"]).returncode
+    except OSError:
+        return False
+    return rc == 0 and root_keyring_ready()
+
+
 def excluded_nodes() -> dict[str, float]:
     """Nodes the watchdog is temporarily avoiding: {address: expiry_unix}."""
     if not os.path.exists(EXCLUDED_FILE):
@@ -159,7 +183,7 @@ def clear_exclusions() -> None:
 def external_ip(timeout: int = 8) -> str | None:
     """Return this host's public IP as seen from the current routing."""
     try:
-        req = Request("https://api.ipify.org", headers={"User-Agent": "dvpnctl"})
+        req = Request(load_cfg()["watch_url"], headers={"User-Agent": "dvpnctl"})
         with urlopen(req, timeout=timeout) as r:
             return r.read().decode().strip()
     except Exception:
@@ -398,10 +422,16 @@ def recover_backup() -> None:
 
 def cmd_init(args):
     if wallet_exists():
-        if os.path.exists(WALLET_BACKUP):
+        if not os.path.exists(WALLET_BACKUP):
+            recover_backup()
+        else:
             print(f"wallet already exists: {my_address()}")
-            return
-        recover_backup()
+        if not root_keyring_ready():
+            print("the service keyring is not seeded yet; finishing setup ...")
+            if ensure_root_keyring():
+                print("service keyring seeded.")
+            else:
+                print("could not seed it now; run: sudo ./install.sh <user>")
         return
     # keys add prompts for a mnemonic then a bip39 passphrase; blank lines accept defaults.
     out = cli_keys(["add", load_cfg()["key_name"], "--output-format", "json"],
@@ -416,7 +446,12 @@ def cmd_init(args):
     os.chmod(WALLET_BACKUP, 0o600)
     print(f"address: {data['address']}")
     print(f"mnemonic backup written to {WALLET_BACKUP} (mode 600)")
-    print("Move that file somewhere safe; it is the only way to recover funds.")
+    print("Keep that file in place for now; move it somewhere safe once setup finishes.")
+    if ensure_root_keyring():
+        print("service keyring seeded. Setup complete.")
+        print("next:  dvpnctl fund   then   dvpnctl up best")
+    else:
+        print("finish setup with:  sudo ./install.sh <user>")
 
 
 def cmd_address(args):
@@ -451,7 +486,10 @@ def balance_dvpn() -> float | None:
 
 def normalize_nodes(raw: str) -> list[dict]:
     import yaml
-    data = yaml.safe_load(raw) or {}
+    return _normalize_data(yaml.safe_load(raw) or {})
+
+
+def _normalize_data(data: dict) -> list[dict]:
     nodes = []
     for it in data.get("items") or []:
         if not isinstance(it, dict):
@@ -530,12 +568,10 @@ def best_node(cfg: dict, nodes: list[dict], exclude: set[str] | None = None) -> 
 
 
 def fetch_one(addr: str) -> dict | None:
-    out = cli(["query", "node", addr], rpc=True)
-    # query node returns {info, node}; reuse the list normalizer
     import yaml
-    data = yaml.safe_load(out) or {}
-    wrapped = {"items": [data]}
-    nodes = normalize_nodes(yaml.safe_dump(wrapped))
+    # query node returns {info, node}; reuse the list normalizer
+    data = yaml.safe_load(cli(["query", "node", addr], rpc=True)) or {}
+    nodes = _normalize_data({"items": [data]})
     return nodes[0] if nodes else None
 
 
@@ -1032,21 +1068,16 @@ def unit_logs(lines: int = 20) -> str:
     return p.stdout or ""
 
 
-def last_unit_error(sid: int) -> str:
-    """Most recent error line from the unit's journal, if it names `sid`."""
-    for line in reversed(unit_logs(15).splitlines()):
-        if f"session {sid}" in line:
-            return line.strip()
-    return ""
-
-
 def connect_failed_already_exists(sid: int) -> bool:
     """True when the unit failed because the node already registered `sid`.
 
     A session's peer can only be handshaken once; a reused session whose probe
     (or a prior run's failed connect) already hit the node is dead for connect.
     """
-    return "already exists in database" in last_unit_error(sid)
+    for line in reversed(unit_logs(15).splitlines()):
+        if f"session {sid}" in line:
+            return "already exists in database" in line
+    return False
 
 
 # ---------------------------------------------------------------- commands
@@ -1064,9 +1095,14 @@ def bring_up(node: dict, cfg: dict, reconcile: bool = True) -> bool:
     `reconcile=False` skips the account-wide session cleanup, for callers that
     already reconciled (the probe loop does it once, not once per candidate).
     """
-    # Check the unit first: without it we would escrow a session only to fail.
+    # Check prerequisites first: without them we would escrow a session only to
+    # fail and leave the deposit locked until expiry.
     if not unit_installed():
         sys.stderr.write(f"tunnel unit {unit_name()} is not installed - run ./install.sh\n")
+        return False
+    if not root_keyring_ready():
+        sys.stderr.write("the root service keyring is not seeded; connect cannot sign.\n")
+        sys.stderr.write("fix: run  dvpnctl init   (or  sudo ./install.sh <user>)\n")
         return False
     sid = start_session(cfg, node, reconcile=reconcile)
     poisoned: set[int] = set()
@@ -1210,6 +1246,9 @@ def cmd_up(args):
     spec = args.node or cfg.get("node") or "best"
     bps = None
     if spec in ("best", "auto") and not args.no_probe:
+        print(f"probing up to {cfg['speed_probe_count']} candidates "
+              f"(each starts and cancels a session; transaction fees apply); "
+              f"use --no-probe to skip.")
         node, bps = probe_and_select(cfg, nodes)
     else:
         node = resolve_node(cfg, spec, nodes)
@@ -1376,6 +1415,60 @@ def cmd_verify(args):
     sys.exit(0 if ok else 1)
 
 
+def cmd_doctor(args):
+    """Read-only readiness check; prints the exact fix for anything missing."""
+    issues: list[str] = []
+
+    def check(label: str, ok: bool, fix: str | None = None, warn: bool = False) -> None:
+        print(f"  [{'ok  ' if ok else ('warn' if warn else 'FAIL')}] {label}")
+        if not ok:
+            if fix:
+                print(f"         -> {fix}")
+            if not warn:
+                issues.append(label)
+
+    print("dvpnctl doctor")
+    check(f"python {sys.version_info.major}.{sys.version_info.minor}",
+          sys.version_info >= (3, 8), "need Python 3.8+")
+    try:
+        import yaml  # noqa: F401
+        yaml_ok = True
+    except ImportError:
+        yaml_ok = False
+    check("PyYAML available", yaml_ok, "install python-yaml (e.g. pacman -S python-yaml)")
+    engine_ok = False
+    try:
+        engine = cli_path()
+        engine_ok = True
+        check(f"engine: {engine}", True)
+    except SystemExit:
+        check("engine: sentinel-dvpncli", False, "run: sudo ./install.sh <user>")
+    for binary in ("wg", "wg-quick", "iptables", "ip6tables", "resolvconf", "systemctl"):
+        check(f"command: {binary}", shutil.which(binary) is not None, f"install {binary}")
+    check(f"config dir: {CFG_DIR}", os.path.isdir(CFG_DIR), "run: dvpnctl init")
+    if engine_ok:
+        addr = my_address()
+        check(f"wallet: {addr}" if addr else "wallet", bool(addr), "run: dvpnctl init")
+    check("mnemonic backup present", os.path.exists(WALLET_BACKUP),
+          "run: dvpnctl init", warn=True)
+    check("root service keyring seeded", root_keyring_ready(),
+          "run: dvpnctl init   (or sudo ./install.sh <user>)")
+    check(f"unit installed: {unit_name()}", unit_installed(),
+          "run: sudo ./install.sh <user>")
+    check("sudoers rule present", os.path.exists("/etc/sudoers.d/dvpnctl"),
+          "run: sudo ./install.sh <user>")
+    if shutil.which("nmcli"):
+        check("NetworkManager uses openresolv",
+              os.path.exists("/etc/NetworkManager/conf.d/90-dvpnctl-resolvconf.conf"),
+              "run: sudo ./install.sh <user>", warn=True)
+    print(f"  [{'ok  ' if unit_active() else 'down'}] service currently active")
+    print(f"  [{'ok  ' if iface_exists() else 'down'}] interface {iface()} present")
+    if issues:
+        print(f"\nNot ready: {len(issues)} issue(s) above (all fixable).")
+        sys.exit(1)
+    print("\nReady. Next:  dvpnctl fund   then   dvpnctl up best")
+
+
 def cmd_watch(args):
     """Health probe; fail over to another node after repeated failures.
 
@@ -1411,8 +1504,7 @@ def cmd_watch(args):
         print(f"watch: excluding {cur} for {cfg['watch_exclude_ttl']}s")
 
     # tear down the bad tunnel, then bring up the best non-excluded node
-    subprocess.run(["sudo", "-n", "systemctl", "stop", unit_name()],
-                   capture_output=True)
+    systemctl("stop", quiet=True)
     if os.path.exists(fails_file):
         os.remove(fails_file)
     nodes = fetch_nodes(refresh=True)
@@ -1548,6 +1640,7 @@ def main():
     ps.set_defaults(fn=cmd_switch)
 
     sub.add_parser("status", help="show connection + balance").set_defaults(fn=cmd_status)
+    sub.add_parser("doctor", help="check setup readiness").set_defaults(fn=cmd_doctor)
     sub.add_parser("verify", help="prove traffic is tunneled (routing/firewall/exit IP)"
                    ).set_defaults(fn=cmd_verify)
     sub.add_parser("watch", help="health probe + auto-failover (run from a timer)"
