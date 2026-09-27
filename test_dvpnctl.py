@@ -184,10 +184,44 @@ def test_connect_error_detection(m):
     cleared = []
     m.cancel_session = lambda sid, wait=False: cleared.append((sid, wait))
 
-    winner, bps = m.probe_and_select(
+    # probe_candidates returns the (reordered) probe order; fast is last here
+    winner, bps, up = m.probe_and_select(
         {"speed_cache_ttl": 1, "speed_probe_count": 2}, [slow, fast])
     assert winner is fast and bps == 2_000_000.0
-    assert (22, True) in cleared, "winner's handshaken probe session must be cleared"
+    assert up is True, "fastest probes last must be kept connected"
+    assert (22, True) not in cleared, \
+        "kept winner's session must not be cancelled"
+
+
+def test_probe_clears_winner_when_not_last(m):
+    # winner is the first candidate, so the still-up last one is torn down and
+    # the winner's probe session is cleared for a fresh connect
+    m.unit_installed = lambda: True
+    m.load_cfg = lambda: {"unit_name": "u.service"}
+    fast = {"address": "fast", "moniker": "F", "country": "DE"}
+    slow = {"address": "slow", "moniker": "S", "country": "DE"}
+    m.probe_candidates = lambda cfg, nodes: [fast, slow]
+    m.cached_speed = lambda addr, ttl: None
+    m.reconcile_sessions = lambda wanted: {}
+    cur = {}
+
+    def fake_bring(n, cfg, reconcile=True):
+        cur["addr"] = n["address"]
+        return True
+
+    m.bring_up = fake_bring
+    m.measure_speed = lambda cfg: 2_000_000.0 if cur["addr"] == "fast" else 1_000_000.0
+    m.read_session_file = lambda: {"fast": 22, "slow": 11}[cur["addr"]]
+    m.record_speed = lambda addr, bps: None
+    torn = []
+    m.tear_down_iface = lambda cancel=True: torn.append(cancel)
+    cleared = []
+    m.cancel_session = lambda sid, wait=False: cleared.append((sid, wait))
+    winner, bps, up = m.probe_and_select(
+        {"speed_cache_ttl": 1, "speed_probe_count": 2}, [fast, slow])
+    assert winner is fast and bps == 2_000_000.0 and up is False
+    assert (22, True) in cleared, "winner's probe session must be cleared to reconnect"
+    assert torn, "the leftover last candidate must be torn down"
 
 
 def test_probe_missing_unit_falls_back(m):
@@ -195,7 +229,7 @@ def test_probe_missing_unit_falls_back(m):
     m.load_cfg = lambda: {"unit_name": "u.service"}
     m.best_node = lambda cfg, nodes, exclude=None: nodes[0]
     nodes = [{"address": "a", "moniker": "M", "downlink": 1}]
-    assert m.probe_and_select({"speed_cache_ttl": 1}, nodes) == (nodes[0], None)
+    assert m.probe_and_select({"speed_cache_ttl": 1}, nodes) == (nodes[0], None, False)
 
 
 def test_probe_uses_cached_speed(m):
@@ -207,8 +241,8 @@ def test_probe_uses_cached_speed(m):
     m.reconcile_sessions = lambda wanted: {}
     m.bring_up = lambda n, cfg, reconcile=True: (_ for _ in ()).throw(
         AssertionError("re-probed a cached node"))
-    got, bps = m.probe_and_select({"speed_cache_ttl": 1}, [node])
-    assert got is node and bps == 1_000_000.0
+    got, bps, up = m.probe_and_select({"speed_cache_ttl": 1}, [node])
+    assert got is node and bps == 1_000_000.0 and up is False
 
 
 def test_probe_reconciles_once(m):

@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------- constants
@@ -259,6 +260,19 @@ def run(cmd: list[str], check: bool = True, stdin: str | None = None) -> subproc
         sys.stderr.write((p.stdout or "") + clean_stderr(p.stderr or ""))
         sys.exit(p.returncode)
     return p
+
+
+def run_parallel(fn, items: list):
+    """Apply fn to every item concurrently, preserving order.
+
+    The session readers query every endpoint anyway (for majority voting), so
+    doing it in parallel makes wall time the slowest endpoint instead of their
+    sum, without changing which requests are made or how the votes are counted.
+    """
+    if len(items) <= 1:
+        return [fn(i) for i in items]
+    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        return list(pool.map(fn, items))
 
 
 def cli(args: list[str], check: bool = True, stdin: str | None = None,
@@ -665,10 +679,10 @@ def find_active_session(addr: str, node: str, timeout: float = 20.0,
     while True:
         votes: dict[int, int] = {}  # session id -> number of endpoints agreeing
         responders = 0
-        for url in endpoints:
-            p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
-                     "query", "sessions", "--account-addr", addr, "--page.limit", "100",
-                     "--rpc.addrs", url, "--rpc.timeout", "15s"], check=False)
+        cmds = [[cli_path(), "--home", cli_home(), "--log.level", "error",
+                 "query", "sessions", "--account-addr", addr, "--page.limit", "100",
+                 "--rpc.addrs", url, "--rpc.timeout", "15s"] for url in endpoints]
+        for p in run_parallel(lambda c: run(c, check=False), cmds):
             if p.returncode != 0:
                 continue
             responders += 1
@@ -830,8 +844,7 @@ def session_status_consensus(sid: int):
     cfg = load_cfg()
     endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
     counts: dict[str, int] = {}
-    for url in endpoints:
-        st = session_status(sid, url)
+    for st in run_parallel(lambda url: session_status(sid, url), endpoints):
         if st is None:
             continue
         key = "active" if session_active(st) else "inactive"
@@ -881,8 +894,8 @@ def working_rpc(sid: int) -> str:
     """First endpoint that actually reports this session active (RPC nodes lag)."""
     cfg = load_cfg()
     endpoints = [cfg["rpc"]] + [u for u in RPC_FALLBACKS if u != cfg["rpc"]]
-    for url in endpoints:
-        if session_on(url, sid):
+    for url, on in zip(endpoints, run_parallel(lambda u: session_on(u, sid), endpoints)):
+        if on:
             return url
     return cfg["rpc"]
 
@@ -933,11 +946,11 @@ def all_sessions() -> list[dict]:
     by_id: dict[int, dict] = {}
     active_votes: dict[int, int] = {}
     responders = 0
-    for url in endpoints:
-        p = run([cli_path(), "--home", cli_home(), "--log.level", "error",
-                 "query", "sessions", "--account-addr", my_address(),
-                 "--page.limit", "200", "--rpc.addrs", url, "--rpc.timeout", "15s"],
-                check=False)
+    cmds = [[cli_path(), "--home", cli_home(), "--log.level", "error",
+             "query", "sessions", "--account-addr", my_address(),
+             "--page.limit", "200", "--rpc.addrs", url, "--rpc.timeout", "15s"]
+            for url in endpoints]
+    for p in run_parallel(lambda c: run(c, check=False), cmds):
         if p.returncode != 0:
             continue
         responders += 1
@@ -1158,20 +1171,29 @@ def probe_candidates(cfg: dict, nodes: list[dict]) -> list[dict]:
         candidates = [n for n in sort_nodes(nodes) if n["address"] not in exc]
     if not candidates:
         sys.exit("no candidate nodes available")
-    return candidates[:max(1, cfg["speed_probe_count"])]
+    selected = candidates[:max(1, cfg["speed_probe_count"])]
+    # Probe worst-advertised first so the best-advertised is probed last. If it
+    # also measures fastest, its tunnel is still up and we keep it instead of
+    # tearing it down and reconnecting. Selection is unchanged; only order is.
+    return sorted(selected, key=lambda n: n["downlink"])
 
 
-def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
+def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None, bool]:
     """Test the top candidates and keep the fastest measured one.
 
     Each candidate is connected for real (a refundable session is escrowed then
     cancelled for losers). Measured speeds are cached so repeat calls can skip
     known-slow nodes. Falls back to the advertised-best node if nothing measures.
+
+    Returns (node, measured_bps_or_None, already_connected). already_connected
+    is True when the winner's tunnel is the one still up, so the caller can skip
+    the reconnect: the last candidate is left connected, and if it wins we save
+    a session-cancel, a fresh session, and a connect.
     """
     if not unit_installed():
         node = best_node(cfg, nodes, exclude=set(excluded_nodes()))
         print(f"tunnel unit {unit_name()} is not installed; run ./install.sh")
-        return node, None
+        return node, None, False
 
     top = probe_candidates(cfg, nodes)
     # Reconcile once for the whole run: sweeping stale sessions on every
@@ -1179,6 +1201,8 @@ def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
     reconcile_sessions({})
     ranked: list[tuple[dict, float]] = []
     probed: dict[str, int] = {}  # node address -> session id its probe used
+    left_up: dict | None = None  # the last candidate, if we kept it connected
+    last = top[-1] if top else None
     for node in top:
         cached = cached_speed(node["address"], cfg["speed_cache_ttl"])
         if cached is not None:
@@ -1202,16 +1226,25 @@ def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
         ranked.append((node, bps))
         if sid is not None:
             probed[node["address"]] = sid
-        tear_down_iface(cancel=True)
+        if node is last:
+            left_up = node
+        else:
+            tear_down_iface(cancel=True)
 
     if not ranked:
         # nothing connected; fall back to advertised best so `up` still tries
         node = best_node(cfg, nodes, exclude=set(excluded_nodes()))
         print(f"no node could be measured; falling back to {node['moniker']}")
-        return node, None
+        return node, None, False
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     winner, bps = ranked[0]
+    if left_up is winner:
+        # The fastest node is still connected; keep that tunnel as-is.
+        print(f"fastest: {winner['moniker']} at {bps / 1e6:.1f} MB/s (live)")
+        return winner, bps, True
+    if left_up is not None:
+        tear_down_iface(cancel=True)
     # The winning node already registered its probe session's peer, so handing
     # that session to `connect` again is rejected with "already exists in
     # database". Drop it fully; bring_up then escrows a fresh session (the
@@ -1223,7 +1256,7 @@ def probe_and_select(cfg: dict, nodes: list[dict]) -> tuple[dict, float | None]:
         except SystemExit:
             print(f"  warning: could not clear probe session {psid}")
     print(f"fastest: {winner['moniker']} at {bps / 1e6:.1f} MB/s")
-    return winner, bps
+    return winner, bps, False
 
 
 def cmd_up(args):
@@ -1241,11 +1274,12 @@ def cmd_up(args):
 
     spec = args.node or cfg.get("node") or "best"
     bps = None
+    already_up = False
     if spec in ("best", "auto") and not args.no_probe:
         print(f"probing up to {cfg['speed_probe_count']} candidates "
               f"(each starts and cancels a session; transaction fees apply); "
               f"use --no-probe to skip.")
-        node, bps = probe_and_select(cfg, nodes)
+        node, bps, already_up = probe_and_select(cfg, nodes)
     else:
         node = resolve_node(cfg, spec, nodes)
 
@@ -1255,9 +1289,12 @@ def cmd_up(args):
     print(f"endpoint: {node['moniker']} [{node['country']}] {price_note}  "
           f"{node['address']}{speed_note}")
 
-    print("bringing up tunnel ...")
-    if not bring_up(node, cfg):
-        sys.exit(1)
+    if already_up:
+        print("keeping the connected tunnel ...")
+    else:
+        print("bringing up tunnel ...")
+        if not bring_up(node, cfg):
+            sys.exit(1)
     print(f"ON  {node['moniker']}  {node['country']}  "
           f"[full tunnel + kill switch, {session_mode_label(cfg)}]")
     cmd_status(args)
@@ -1296,6 +1333,8 @@ def session_report(sid: int) -> str | None:
              f"{human_bytes(up)} up), cost ~{cost:.4f} DVPN"]
     if escrow:
         parts.append(f"refund ~{escrow - cost:.4f} of {escrow:.4f} DVPN escrowed")
+    if used == 0:
+        parts.append("usage may still be settling on-chain")
     return f"session {sid}: " + ", ".join(parts)
 
 
