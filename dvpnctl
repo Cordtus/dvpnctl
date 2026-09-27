@@ -1100,10 +1100,6 @@ def bring_up(node: dict, cfg: dict, reconcile: bool = True) -> bool:
     if not unit_installed():
         sys.stderr.write(f"tunnel unit {unit_name()} is not installed - run ./install.sh\n")
         return False
-    if not root_keyring_ready():
-        sys.stderr.write("the root service keyring is not seeded; connect cannot sign.\n")
-        sys.stderr.write("fix: run  dvpnctl init   (or  sudo ./install.sh <user>)\n")
-        return False
     sid = start_session(cfg, node, reconcile=reconcile)
     poisoned: set[int] = set()
     for attempt in (1, 2, 3):
@@ -1451,12 +1447,18 @@ def cmd_doctor(args):
         check(f"wallet: {addr}" if addr else "wallet", bool(addr), "run: dvpnctl init")
     check("mnemonic backup present", os.path.exists(WALLET_BACKUP),
           "run: dvpnctl init", warn=True)
-    check("root service keyring seeded", root_keyring_ready(),
-          "run: dvpnctl init   (or sudo ./install.sh <user>)")
+    check("service keyring marked ready", root_keyring_ready(),
+          "run `sudo ./install.sh <user>` to mark it (not required if the tunnel works)",
+          warn=True)
     check(f"unit installed: {unit_name()}", unit_installed(),
           "run: sudo ./install.sh <user>")
-    check("sudoers rule present", os.path.exists("/etc/sudoers.d/dvpnctl"),
-          "run: sudo ./install.sh <user>")
+    # `sudo -n` denies with a "password is required" message; systemctl's own
+    # exit code is not a reliable signal (reset-failed can fail for other
+    # reasons), so look for the denial text.
+    sudo_out = subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit_name()],
+                              capture_output=True, text=True)
+    denied = "password is required" in sudo_out.stderr.lower()
+    check("passwordless unit control", not denied, "run: sudo ./install.sh <user>")
     if shutil.which("nmcli"):
         check("NetworkManager uses openresolv",
               os.path.exists("/etc/NetworkManager/conf.d/90-dvpnctl-resolvconf.conf"),
