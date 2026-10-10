@@ -368,6 +368,76 @@ def test_session_report(m):
         m.my_address = real_addr
 
 
+def test_transfer_totals(m):
+    real = m.wg_show
+    m.wg_show = lambda *a: "PUBKEY=\t123\t456\n"
+    try:
+        assert m.transfer_totals() == (123, 456)
+        m.wg_show = lambda *a: ""
+        assert m.transfer_totals() is None
+    finally:
+        m.wg_show = real
+
+
+def test_wait_for_iface_ends_with_engine(m):
+    saved = {k: getattr(m, k) for k in ("unit_active", "iface_exists")}
+    real_sleep, real_time = m.time.sleep, m.time.time
+    try:
+        # engine ran, then exited -> stop waiting instead of burning the timeout
+        states = iter(["active", "active", "activating"])
+        m.unit_active = lambda name=None: next(states) == "active"
+        m.iface_exists = lambda: False
+        m.time.sleep = lambda s: None
+        m.time.time = lambda: 0.0
+        assert m.wait_for_iface(timeout=45) is False
+        # engine already dead before the first poll -> no spin at all
+        m.unit_active = lambda name=None: False
+        slept = []
+        m.time.sleep = lambda s: slept.append(s)
+        assert m.wait_for_iface(timeout=45) is False
+        assert slept == [], "must not spin after the engine exited"
+        # interface present -> success
+        m.unit_active = lambda name=None: True
+        m.iface_exists = lambda: True
+        assert m.wait_for_iface(timeout=45) is True
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+        m.time.sleep, m.time.time = real_sleep, real_time
+
+
+def test_up_failure_cleans_up(m):
+    import argparse
+    node = {"address": "sentnode1bad", "moniker": "BAD", "country": "XX",
+            "gb": {"base": "1", "quote": 10000000}, "hour": None}
+    saved = {k: getattr(m, k) for k in (
+        "wallet_exists", "fetch_nodes", "load_cfg", "save_cfg", "resolve_node",
+        "bring_up", "exclude_node", "tear_down_iface")}
+    cfg = dict(m.DEFAULTS)
+    m.wallet_exists = lambda: True
+    m.fetch_nodes = lambda: [node]
+    m.load_cfg = lambda: dict(cfg)
+    m.save_cfg = lambda c: None
+    m.resolve_node = lambda c, spec, nodes: node
+    m.bring_up = lambda n, c, reconcile=True: False
+    acted = {}
+    m.exclude_node = lambda addr, ttl: acted.update(excluded=(addr, ttl))
+    m.tear_down_iface = lambda cancel=True: acted.update(torn=cancel)
+    try:
+        try:
+            m.cmd_up(argparse.Namespace(node="best", gigabytes=None, hours=None,
+                                        no_probe=True, stay=False))
+        except SystemExit as e:
+            assert e.code == 1, e.code
+        else:
+            raise AssertionError("a failed up must exit non-zero")
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+    assert acted["excluded"] == ("sentnode1bad", cfg["watch_exclude_ttl"]), acted
+    assert acted["torn"] is True, acted
+
+
 def test_recover_backup_rejects_mismatch(m, tmp):
     import os
     m.CFG_DIR = tmp

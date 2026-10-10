@@ -9,6 +9,8 @@ wraps the official `sentinel-dvpncli` to give you:
   restarts it on failure.
 - **Fastest-node selection** — `up best` measures real speed through the top
   candidates and keeps the quickest.
+- **Live status** — `up --stay` (or `status -f`) holds a non-scrolling view of
+  uptime, transfer counters, and session spend; Ctrl-C leaves the tunnel up.
 - **Easy switching and cleanup** — switch endpoints in one command; stale
   on-chain sessions are cancelled and recycled automatically.
 - **Optional auto-failover** — a timer probes the tunnel and moves to a new node
@@ -48,10 +50,12 @@ Keep the repo in place — `/usr/local/bin/dvpnctl` points into it.
 ## Commands
 
 ```bash
-dvpnctl up best       # connect
-dvpnctl switch kfmg   # move to a better endpoint
-dvpnctl status        # connection, session, balance
-dvpnctl down          # disconnect (cancels the session, refunds unused deposit)
+dvpnctl up best          # connect
+dvpnctl up best --stay   # connect, then hold a live status screen until Ctrl-C
+dvpnctl switch kfmg      # move to a better endpoint
+dvpnctl status           # connection, session, balance
+dvpnctl status -f        # live view of a running tunnel
+dvpnctl down             # disconnect (cancels the session, refunds unused deposit)
 ```
 
 | Command | What it does |
@@ -62,15 +66,27 @@ dvpnctl down          # disconnect (cancels the session, refunds unused deposit)
 | `fund` | Show the address to fund and a suggested amount. |
 | `nodes [-r] [-c CC] [-a]` | List WireGuard nodes by price. `-r` refresh, `-c` filter by country, `-a` ignore the price cap. |
 | `best` | Print the auto-picked node. |
-| `up [node] [--no-probe] [-g GB] [-H H]` | Connect. With no node it probes for the fastest; `--no-probe` takes the advertised best. `-g`/`-H` set the session size. |
+| `up [node] [--no-probe] [--stay] [-g GB] [-H H]` | Connect. With no node it probes for the fastest; `--no-probe` takes the advertised best. `--stay` holds a live status view after connecting. `-g`/`-H` set the session size. |
 | `down [--keep-session]` | Disconnect and cancel the session (refunding unused deposit); `--keep-session` keeps it. |
 | `switch <node>` | Move to another endpoint. |
-| `status` | Show connection, session, and balance. |
+| `status [-f]` | Show connection, session, and balance; `-f` live-updates until Ctrl-C. |
 | `verify` | Prove traffic is actually tunneled. |
 | `watch` | One failover health check (run by the timer). |
 
 A node can be given as a list index (`3`), a moniker substring (`kfmg`), a full
 `sentnode1…` address, or `best`.
+
+## Live status
+
+`dvpnctl up best --stay` connects and then keeps the terminal in a live,
+non-scrolling view: tunnel uptime, down/up byte totals with per-second rates,
+and the session's on-chain usage (spent and remaining DVPN, remaining GB)
+refreshed every 15 s, plus the wallet balance. Ctrl-C **detaches** — the
+systemd unit keeps the tunnel running. `dvpnctl status -f` attaches the same
+view to an existing connection.
+
+The view needs a TTY: without one, `status -f` and `up --stay` fall back to the
+one-shot status output.
 
 ## Node selection
 

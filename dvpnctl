@@ -591,7 +591,9 @@ def fetch_one(addr: str) -> dict | None:
 
 def resolve_node(cfg: dict, spec: str, nodes: list[dict]) -> dict:
     if not spec or spec in ("best", "auto"):
-        return best_node(cfg, nodes)
+        # honor watchdog/up-failure exclusions so a just-failed node is not
+        # instantly repicked from the cached node list
+        return best_node(cfg, nodes, exclude=set(excluded_nodes()))
     if spec.startswith("sentnode"):
         for n in nodes:
             if n["address"] == spec:
@@ -1066,10 +1068,21 @@ def wg_show(*args: str) -> str:
     return p.stdout if p.returncode == 0 else ""
 
 
-def wait_for_iface(timeout: float = 40.0) -> bool:
+def wait_for_iface(timeout: float = 45.0) -> bool:
+    """Wait for the tunnel, or until the engine process exits.
+
+    `systemctl restart` returns once a Type=simple unit is active, so a
+    non-active sample means the engine has exited: return at once (its error is
+    in the journal now, and a systemd auto-restart would only replay the same
+    failure). The cap is for engines still working, e.g. a node whose handshake
+    burns its full ~15 s timeout. The old fixed 15 s wait raced that and tore
+    down connects still in flight, reporting a failure with no error line.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if unit_active() and iface_exists():
+        if not unit_active():
+            return False
+        if iface_exists():
             return True
         time.sleep(1)
     return False
@@ -1086,10 +1099,16 @@ def connect_failed_already_exists(sid: int) -> bool:
 
     A session's peer can only be handshaken once; a reused session whose probe
     (or a prior run's failed connect) already hit the node is dead for connect.
+    The engine's error can take a moment to reach the journal after the process
+    exits, so poll briefly before concluding the line is absent.
     """
-    for line in reversed(unit_logs(15).splitlines()):
-        if f"session {sid}" in line:
-            return "already exists in database" in line
+    pat = re.compile(rf"session {sid}\b")
+    for attempt in range(3):
+        for line in reversed(unit_logs(15).splitlines()):
+            if pat.search(line):
+                return "already exists in database" in line
+        if attempt < 2:
+            time.sleep(0.5)
     return False
 
 
@@ -1123,7 +1142,7 @@ def bring_up(node: dict, cfg: dict, reconcile: bool = True) -> bool:
         if systemctl("restart") != 0:
             sys.stderr.write("could not start the tunnel unit\n")
             return False
-        if wait_for_iface(timeout=15):
+        if wait_for_iface(timeout=45):
             return True
         if connect_failed_already_exists(sid):
             # Stale session whose peer the node already registered (a probe or an
@@ -1294,10 +1313,24 @@ def cmd_up(args):
     else:
         print("bringing up tunnel ...")
         if not bring_up(node, cfg):
+            # Leave the host and the chain clean: no systemd restart flailing,
+            # no session left escrowed, and remember the node failed so the next
+            # `up best` (or bare `up`, via the cleared last-node) does not
+            # instantly repick it from the speed cache.
+            print(f"FAILED to connect to {node['moniker']} [{node['country']}]",
+                  file=sys.stderr)
+            exclude_node(node["address"], cfg["watch_exclude_ttl"])
+            cfg.pop("node", None)
+            cfg.pop("node_moniker", None)
+            save_cfg(cfg)
+            tear_down_iface(cancel=True)
             sys.exit(1)
     print(f"ON  {node['moniker']}  {node['country']}  "
           f"[full tunnel + kill switch, {session_mode_label(cfg)}]")
-    cmd_status(args)
+    if getattr(args, "stay", False) and sys.stdout.isatty():
+        follow_status()
+    else:
+        cmd_status(args)
 
 
 def human_bytes(n: int) -> str:
@@ -1310,8 +1343,8 @@ def human_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def session_report(sid: int) -> str | None:
-    """One-line bandwidth/cost summary for a session, read from the chain."""
+def session_usage(sid: int) -> dict | None:
+    """On-chain bandwidth counters and price for one of our sessions."""
     import yaml
     data = yaml.safe_load(cli(["query", "session", str(sid)], rpc=True)) or {}
     s = data.get("base_session") or {}
@@ -1328,14 +1361,136 @@ def session_report(sid: int) -> str | None:
     quote = int(price.get("quote_value") or 0)  # udvpn per GB
     max_bytes = int(s.get("max_bytes") or 0)
     cost = used / 1e9 * quote / 1e6
-    escrow = max_bytes / 1e9 * quote / 1e6
-    parts = [f"{human_bytes(used)} used ({human_bytes(down)} down, "
-             f"{human_bytes(up)} up), cost ~{cost:.4f} DVPN"]
-    if escrow:
-        parts.append(f"refund ~{escrow - cost:.4f} of {escrow:.4f} DVPN escrowed")
-    if used == 0:
+    return {"down": down, "up": up, "used": used,
+            "max_bytes": max_bytes, "cost": cost,
+            "escrow": max_bytes / 1e9 * quote / 1e6}
+
+
+def session_report(sid: int) -> str | None:
+    """One-line bandwidth/cost summary for a session, read from the chain."""
+    u = session_usage(sid)
+    if u is None:
+        return None
+    parts = [f"{human_bytes(u['used'])} used ({human_bytes(u['down'])} down, "
+             f"{human_bytes(u['up'])} up), cost ~{u['cost']:.4f} DVPN"]
+    if u["escrow"]:
+        parts.append(f"refund ~{u['escrow'] - u['cost']:.4f} of "
+                     f"{u['escrow']:.4f} DVPN escrowed")
+    if u["used"] == 0:
         parts.append("usage may still be settling on-chain")
     return f"session {sid}: " + ", ".join(parts)
+
+
+def fmt_duration(sec: float) -> str:
+    s = int(sec)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return (f"{d}d " if d else "") + f"{h}:{m:02d}:{s:02d}"
+
+
+def unit_uptime() -> float | None:
+    """Seconds since the unit entered active, per systemd's monotonic clock."""
+    p = subprocess.run(["systemctl", "show", unit_name(),
+                        "-p", "ActiveEnterTimestampMonotonic", "--value"],
+                       capture_output=True, text=True)
+    try:
+        since = int(p.stdout.strip()) / 1e6
+    except ValueError:
+        return None
+    return max(0.0, time.monotonic() - since) if since > 0 else None
+
+
+def transfer_totals() -> tuple[int, int] | None:
+    """(rx, tx) bytes on the tunnel interface, or None if unreadable."""
+    rx = tx = 0
+    seen = False
+    for line in wg_show("transfer").splitlines():
+        f = line.split()
+        if len(f) == 3 and f[1].isdigit() and f[2].isdigit():
+            rx += int(f[1])
+            tx += int(f[2])
+            seen = True
+    return (rx, tx) if seen else None
+
+
+def follow_status() -> None:
+    """Live, non-scrolling status until Ctrl-C; the tunnel stays up.
+
+    Counters come from `wg show ... transfer` every second, the on-chain spend
+    from one session query every 15 s (RPCs rate-limit and the provider counters
+    lag anyway). Uptime is the unit's active-entry time, so attaching later
+    still shows the real age of the tunnel.
+    """
+    cfg = load_cfg()
+    sid = read_session_file()
+    node = cfg.get("node_moniker") or cfg.get("node") or "?"
+    usage = balance = None
+    next_usage = 0.0
+    prev = None
+    prev_t = 0.0
+    rx_rate = tx_rate = None
+    sys.stdout.write("\033[2J")  # start from a clean screen
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= next_usage:
+                cfg = load_cfg()
+                sid = read_session_file()  # `switch`/watchdog may have moved it
+                node = cfg.get("node_moniker") or cfg.get("node") or node
+                try:
+                    usage = session_usage(sid) if sid else None
+                except SystemExit:
+                    pass  # keep the last good reading
+                try:
+                    balance = balance_dvpn()
+                except SystemExit:
+                    pass
+                next_usage = now + 15
+            totals = transfer_totals()
+            if totals and prev and now > prev_t:
+                rx_rate = max(0.0, (totals[0] - prev[0]) / (now - prev_t))
+                tx_rate = max(0.0, (totals[1] - prev[1]) / (now - prev_t))
+            if totals:
+                prev, prev_t = totals, now
+
+            up = unit_active() and iface_exists()
+            uptime = unit_uptime() if up else None
+            lines = [f"Sentinel dVPN - {node}"]
+            lines.append("tunnel  : " + ("UP (full tunnel + kill switch)" if up
+                                         else "DOWN - waiting for the unit"))
+            if uptime is not None:
+                lines.append(f"uptime  : {fmt_duration(uptime)}")
+            if sid:
+                lines.append(f"session : {sid}")
+            if totals:
+                rd = f" ({human_bytes(int(rx_rate))}/s)" if rx_rate is not None else ""
+                ru = f" ({human_bytes(int(tx_rate))}/s)" if tx_rate is not None else ""
+                lines.append(f"data    : down {human_bytes(totals[0])}{rd}   "
+                             f"up {human_bytes(totals[1])}{ru}")
+            if usage:
+                line = (f"usage   : {human_bytes(usage['used'])} used, "
+                        f"spent ~{usage['cost']:.4f} DVPN")
+                if usage["escrow"]:
+                    left = max(0.0, usage["escrow"] - usage["cost"])
+                    gb = max(0, usage["max_bytes"] - usage["used"]) / 1e9
+                    line += (f", left ~{left:.4f} DVPN of {usage['escrow']:.4f} "
+                             f"({gb:.2f} GB)")
+                lines.append(line)
+            elif sid:
+                lines.append("usage   : session not on-chain yet (retrying)")
+            else:
+                lines.append("usage   : no session")
+            if balance is not None:
+                lines.append(f"balance : {balance:.4f} DVPN")
+            lines.append("")
+            lines.append("Ctrl-C detaches; the tunnel stays up (dvpnctl down to disconnect)")
+            sys.stdout.write("\033[H" + "\n".join(lines) + "\033[J")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        print("detached - the tunnel stays up; dvpnctl down disconnects")
 
 
 def cmd_down(args):
@@ -1372,6 +1527,11 @@ def cmd_switch(args):
 
 
 def cmd_status(args):
+    if getattr(args, "follow", False):
+        if sys.stdout.isatty():
+            follow_status()
+            return
+        print("--follow needs a terminal; showing a one-shot status instead")
     cfg = load_cfg()
     print(f"service : {'active' if unit_active() else 'inactive'} ({unit_name()})")
     if iface_exists():
@@ -1667,6 +1827,8 @@ def main():
     pu.add_argument("node", nargs="?", help="#, moniker, address, or best")
     pu.add_argument("--no-probe", action="store_true",
                     help="skip speed probing; take the first advertised-best node")
+    pu.add_argument("--stay", action="store_true",
+                    help="after connecting, stay in a live status view (Ctrl-C to detach)")
     add_session_flags(pu)
     pu.set_defaults(fn=cmd_up)
 
@@ -1680,7 +1842,10 @@ def main():
     add_session_flags(ps)
     ps.set_defaults(fn=cmd_switch)
 
-    sub.add_parser("status", help="show connection + balance").set_defaults(fn=cmd_status)
+    pst = sub.add_parser("status", help="show connection + balance")
+    pst.add_argument("-f", "--follow", action="store_true",
+                     help="live-updating view until Ctrl-C (tunnel stays up)")
+    pst.set_defaults(fn=cmd_status)
     sub.add_parser("doctor", help="check setup readiness").set_defaults(fn=cmd_doctor)
     sub.add_parser("verify", help="prove traffic is tunneled (routing/firewall/exit IP)"
                    ).set_defaults(fn=cmd_verify)
