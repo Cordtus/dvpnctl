@@ -149,6 +149,39 @@ def test_bring_up_retries_stale_session(m):
     assert poison_seen == [{100}], "rejected id must be excluded from re-selection"
 
 
+def test_bring_up_retries_lagging_node(m):
+    # The node's chain view lags the block holding our session-start tx: the
+    # handshake says "does not exist on blockchain" for a session that is real.
+    # bring_up must wait and restart, not cancel the session or fail the run.
+    saved = {k: getattr(m, k) for k in (
+        "unit_installed", "unit_name", "systemctl", "write_session_file",
+        "start_session", "wait_for_iface", "connect_failed_already_exists",
+        "unit_logs", "cancel_session")}
+    real_sleep = m.time.sleep
+    waits = {"n": 0}
+    m.unit_installed = lambda: True
+    m.unit_name = lambda: "u.service"
+    m.systemctl = lambda *a, **k: 0
+    m.write_session_file = lambda sid: None
+    m.start_session = lambda cfg, node, reconcile=True, exclude=None: 300
+    m.connect_failed_already_exists = lambda sid: False
+    m.unit_logs = lambda n=20: (
+        "Error: run: building service \"wireguard\": performing node handshake: "
+        "performing init handshake request for session 300: response body "
+        "contains error: code=5, message=session 300 does not exist on "
+        "blockchain\n")
+    m.wait_for_iface = lambda timeout=45: (
+        waits.__setitem__("n", waits["n"] + 1) or waits["n"] >= 3)
+    m.time.sleep = lambda s: None
+    try:
+        assert m.bring_up({"moniker": "M", "address": "a"}, {}) is True
+    finally:
+        m.time.sleep = real_sleep
+        for k, v in saved.items():
+            setattr(m, k, v)
+    assert waits["n"] == 3, "must restart after the node's chain view catches up"
+
+
 def test_connect_error_detection(m):
     real_logs = m.unit_logs
     m.unit_name = lambda: "u.service"

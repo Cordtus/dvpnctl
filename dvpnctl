@@ -1112,6 +1112,18 @@ def connect_failed_already_exists(sid: int) -> bool:
     return False
 
 
+def session_not_on_chain(sid: int) -> bool:
+    """True when the unit failed because the node's chain view lacks `sid`.
+
+    A session-start tx lands in a block before the node we handshake has seen
+    that block, so the node answers "does not exist on blockchain" for a session
+    that is real and already confirmed on our own endpoints. Transient: retry
+    the connect, never cancel the session.
+    """
+    pat = re.compile(rf"session {sid}\b.*does not exist on blockchain")
+    return any(pat.search(line) for line in unit_logs(15).splitlines())
+
+
 # ---------------------------------------------------------------- commands
 
 def session_mode_label(cfg: dict) -> str:
@@ -1160,6 +1172,12 @@ def bring_up(node: dict, cfg: dict, reconcile: bool = True) -> bool:
             except SystemExit:
                 print(f"  could not clear stale session {sid}; leaving it to expire")
             sid = start_session(cfg, node, reconcile=False, exclude=poisoned)
+            continue
+        if attempt < 3 and session_not_on_chain(sid):
+            # The node's chain view is a block behind the session-start tx.
+            # Waiting one block and restarting is enough; the session is good.
+            print(f"  {node['moniker']} has not seen session {sid} yet; retrying")
+            time.sleep(8)
             continue
         break
     sys.stderr.write("tunnel did not come up; recent logs:\n")
